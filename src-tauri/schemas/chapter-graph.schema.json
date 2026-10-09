@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rimenovel.dev/schemas/chapter-graph.schema.json",
+  "title": "RimeNovel 章节知识图谱（抽取信封，chapter/window 双模式）",
+  "description": "LLM 结构化抽取的输出信封。mode=chapter：单章抽取（阅读懒抽取 / 生成章回抽 / 前向调和产物）。mode=window：导入期全局流水线的多章窗口抽取，事件需各自标注 chapter_idx，并附逐章摘要。存储层与 effective 视图在此基础上叠加 provenance 等字段（设计文档 §3.1/§3.3），不进 LLM 边界。本 schema 按 OpenAI structured outputs strict 规范编写：所有字段 required、additionalProperties=false、可空字段用 anyOf null。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "chapter_idx",
+    "chapter_summary",
+    "chapter_summaries",
+    "open_threads",
+    "entities",
+    "relations",
+    "events"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["1"] },
+    "mode": {
+      "type": "string",
+      "enum": ["chapter", "window"],
+      "description": "chapter=单章抽取；window=多章窗口抽取（全局流水线）"
+    },
+    "chapter_idx": {
+      "anyOf": [{ "type": "integer" }, { "type": "null" }],
+      "description": "mode=chapter：本章序号（从 1 起）；mode=window：必须为 null"
+    },
+    "chapter_summary": {
+      "anyOf": [{ "type": "string" }, { "type": "null" }],
+      "description": "本章一段式摘要（时间线 UI / 调和上下文用）；mode=chapter 必填，mode=window 必须为 null"
+    },
+    "chapter_summaries": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["chapter_idx", "summary"],
+            "properties": {
+              "chapter_idx": { "type": "integer" },
+              "summary": { "type": "string" }
+            }
+          }
+        },
+        { "type": "null" }
+      ],
+      "description": "mode=window：窗口内每章一条摘要（覆盖窗口全部章节）；mode=chapter 必须为 null"
+    },
+    "open_threads": {
+      "anyOf": [
+        { "type": "array", "items": { "type": "string" } },
+        { "type": "null" }
+      ],
+      "description": "章末未解决的悬念/伏笔（连载钩子，供下一章生成与调和参考）；mode=chapter 必填（可为空数组），mode=window 必须为 null"
+    },
+    "entities": {
+      "type": "array",
+      "description": "本章/本窗口出现的实体。已在锚定表（prompt 中提供的全局实体表）中的实体必须复用原 key；新实体生成新 slug",
+      "items": { "$ref": "#/$defs/entity" }
+    },
+    "relations": {
+      "type": "array",
+      "description": "本章/本窗口中可观察到的关系（含状态变化）",
+      "items": { "$ref": "#/$defs/relation" }
+    },
+    "events": {
+      "type": "array",
+      "description": "按叙事顺序排列的事件",
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "$defs": {
+    "entityType": {
+      "type": "string",
+      "enum": ["character", "location", "item", "faction", "concept"]
+    },
+    "entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "type", "name", "aliases", "summary", "traits"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "实体稳定标识：小写拼音 slug（如 lin-dong）。跨章/跨层对齐的唯一依据，同名同实体必须同 key"
+        },
+        "type": { "$ref": "#/$defs/entityType" },
+        "name": { "type": "string", "description": "规范名（本语境最常用称呼）" },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "别名/称号/代称，无则空数组"
+        },
+        "summary": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "description": "一句话身份描述。新实体必填；已锚定实体可为 null（沿用全局既有摘要）"
+        },
+        "traits": {
+          "anyOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "null" }
+          ],
+          "description": "性格/外貌/能力等标签（主要用于 character），无则 null"
+        }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["src", "dst", "rel_category", "rel_type", "description", "status"],
+      "properties": {
+        "src": { "type": "string", "description": "发起方实体 key" },
+        "dst": { "type": "string", "description": "承受方实体 key" },
+        "rel_category": {
+          "type": "string",
+          "enum": [
+            "family",
+            "romantic",
+            "friendship",
+            "enmity",
+            "alliance",
+            "master_student",
+            "subordination",
+            "rivalry",
+            "other"
+          ]
+        },
+        "rel_type": { "type": "string", "description": "具体关系名，如：堂兄弟 / 死敌 / 师徒 / 主仆" },
+        "description": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "description": "该关系在本章/窗口中的体现或变化说明，无则 null"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "broken", "former", "unknown"],
+          "description": "本章/窗口结束时的关系状态"
+        }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "title",
+        "category",
+        "chapter_idx",
+        "order",
+        "participants",
+        "location",
+        "summary",
+        "outcome",
+        "cause"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "事件标识：ev-<chapter>-<seq>，如 ev-3-1（seq 章内递增）"
+        },
+        "title": { "type": "string", "description": "短语标题，如：矿洞冲突" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "conflict",
+            "battle",
+            "meeting",
+            "parting",
+            "journey",
+            "discovery",
+            "betrayal",
+            "deal",
+            "loss",
+            "death",
+            "romance",
+            "mystery",
+            "other"
+          ]
+        },
+        "chapter_idx": {
+          "anyOf": [{ "type": "integer" }, { "type": "null" }],
+          "description": "mode=window：必填；mode=chapter：必须为 null（继承根节点 chapter_idx）"
+        },
+        "order": { "type": "integer", "description": "章内时间顺序，从 1 递增不重复" },
+        "participants": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "参与实体 key 列表（锚定表 ∪ 本输出 entities），无则空数组"
+        },
+        "location": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "description": "发生地实体 key，未知为 null"
+        },
+        "summary": { "type": "string", "description": "事件经过，1-3 句" },
+        "outcome": { "type": "string", "description": "结果/影响；未知写「悬而未决」" },
+        "cause": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "description": "前因事件 key（通常为本章/窗口内更早的事件），无则 null"
+        }
+      }
+    }
+  }
+}

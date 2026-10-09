@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rimenovel.dev/schemas/global-graph.schema.json",
+  "title": "RimeNovel 全局知识图谱（聚合形态）",
+  "description": "全书聚合后的全局图谱：map-reduce 产物，也是 get_graph(scope=global) 与写作 agent 上下文组装中「全局大纲」分量的基础形态。实体/关系/事件由 Rust 合并纯函数从窗口抽取结果（chapter-graph.schema.json, mode=window）累积而成；synopsis 与 style_guide 由两个廉价 reduce 调用产出；first_seen_chapter/last_seen_chapter/importance 由 Rust 启发式计算。存储与 effective 视图在此基础上叠加 provenance 等字段（设计文档 §3.1/§3.3）。按 OpenAI structured outputs strict 规范编写。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "synopsis", "style_guide", "themes", "entities", "relations", "events"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["1"] },
+    "synopsis": { "type": "string", "description": "一段式全书梗概（生成上下文与书架展示用）" },
+    "style_guide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["narrative_person", "tone", "pacing", "signature"],
+      "properties": {
+        "narrative_person": {
+          "type": "string",
+          "enum": ["first", "third_limited", "third_omniscient", "mixed"],
+          "description": "叙事人称：第一人称/第三人称有限/第三人称全知/混合"
+        },
+        "tone": { "type": "string", "description": "语言基调，如：冷峻克制、热血直白" },
+        "pacing": { "type": "string", "description": "叙事节奏，如：快节奏多冲突、慢热细腻" },
+        "signature": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "标志性写法清单（续写模仿用），无则空数组"
+        }
+      }
+    },
+    "themes": {
+      "anyOf": [
+        { "type": "array", "items": { "type": "string" } },
+        { "type": "null" }
+      ],
+      "description": "主题标签，如：复仇、成长、权谋；无则 null"
+    },
+    "entities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/globalEntity" }
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/globalRelation" }
+    },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/globalEvent" }
+    }
+  },
+  "$defs": {
+    "globalEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "type",
+        "name",
+        "aliases",
+        "summary",
+        "traits",
+        "first_seen_chapter",
+        "last_seen_chapter",
+        "importance"
+      ],
+      "properties": {
+        "key": { "type": "string", "description": "与章节图谱一致的稳定 slug" },
+        "type": {
+          "type": "string",
+          "enum": ["character", "location", "item", "faction", "concept"]
+        },
+        "name": { "type": "string" },
+        "aliases": { "type": "array", "items": { "type": "string" } },
+        "summary": { "type": "string", "description": "聚合后的身份描述（合并取最新非空摘要）" },
+        "traits": {
+          "anyOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "null" }
+          ],
+          "description": "性格/外貌/能力标签聚合，无则 null"
+        },
+        "first_seen_chapter": { "type": "integer", "description": "首次出现章（Rust 由事件/关系引用推得）" },
+        "last_seen_chapter": { "type": "integer", "description": "最近出现章" },
+        "importance": {
+          "type": "string",
+          "enum": ["major", "supporting", "minor"],
+          "description": "主要/配角/龙套。Rust 依出现章节数、关系度数、事件参与度启发式计算；用户可在 user 层覆盖"
+        }
+      }
+    },
+    "globalRelation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "src",
+        "dst",
+        "rel_category",
+        "rel_type",
+        "description",
+        "status",
+        "since_chapter",
+        "until_chapter"
+      ],
+      "properties": {
+        "src": { "type": "string" },
+        "dst": { "type": "string" },
+        "rel_category": {
+          "type": "string",
+          "enum": [
+            "family",
+            "romantic",
+            "friendship",
+            "enmity",
+            "alliance",
+            "master_student",
+            "subordination",
+            "rivalry",
+            "other"
+          ]
+        },
+        "rel_type": { "type": "string", "description": "具体关系名" },
+        "description": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }],
+          "description": "关系演变说明，无则 null"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "broken", "former", "unknown"],
+          "description": "全书当前（最新窗口）视角下的状态"
+        },
+        "since_chapter": { "type": "integer", "description": "关系首次确立/出现的章" },
+        "until_chapter": {
+          "anyOf": [{ "type": "integer" }, { "type": "null" }],
+          "description": "关系终结章（status=broken/former 时填写）；仍在延续为 null"
+        }
+      }
+    },
+    "globalEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "title",
+        "category",
+        "chapter_idx",
+        "order",
+        "participants",
+        "location",
+        "summary",
+        "outcome"
+      ],
+      "properties": {
+        "key": { "type": "string", "description": "沿用章节图谱的事件 key（ev-<chapter>-<seq>）" },
+        "title": { "type": "string" },
+        "category": {
+          "type": "string",
+          "enum": [
+            "conflict",
+            "battle",
+            "meeting",
+            "parting",
+            "journey",
+            "discovery",
+            "betrayal",
+            "deal",
+            "loss",
+            "death",
+            "romance",
+            "mystery",
+            "other"
+          ]
+        },
+        "chapter_idx": { "type": "integer" },
+        "order": { "type": "integer", "description": "章内顺序（时间线 = chapter_idx 主序 + order 次序）" },
+        "participants": { "type": "array", "items": { "type": "string" } },
+        "location": {
+          "anyOf": [{ "type": "string" }, { "type": "null" }]
+        },
+        "summary": { "type": "string" },
+        "outcome": { "type": "string" }
+      }
+    }
+  }
+}
