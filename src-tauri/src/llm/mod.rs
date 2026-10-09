@@ -2,6 +2,7 @@
 // 任务路由三类: extract(窗口/章节抽取/回抽/消歧) merge(合并裁决/前向调和) write(正文生成)
 pub mod anthropic;
 pub mod cache;
+pub mod openai;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

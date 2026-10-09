@@ -3,9 +3,9 @@
 
 use crate::core::split::{split_txt, RawChapter, SplitOptions};
 use crate::store::books::{create_book_with_chapters, get_chapter, list_books, NewChapter};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::Mutex;
 
 // 全局连接（单写多读；Tauri 状态管理在 lib.rs 注册）
 pub struct AppState {
@@ -65,7 +65,7 @@ pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, S
     }
     let title = derive_title(p, &chapters);
 
-    let mut guard = state.db.lock().map_err(|e| e.to_string())?;
+    let mut guard = state.db.lock();
     let conn = guard.as_mut().ok_or("数据库未初始化")?;
     create_book_with_chapters(conn, &title, None, format, &path, &chapters)
         .map_err(|e| format!("入库失败: {e}"))
@@ -83,7 +83,7 @@ fn decode_txt(bytes: &[u8]) -> String {
 pub fn list_books_cmd(
     state: tauri::State<AppState>,
 ) -> Result<Vec<crate::store::books::Book>, String> {
-    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let guard = state.db.lock();
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     list_books(conn).map_err(|e| e.to_string())
 }
@@ -99,7 +99,7 @@ pub fn get_chapter_titles(
     state: tauri::State<AppState>,
     book_id: i64,
 ) -> Result<Vec<ChapterMeta>, String> {
-    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let guard = state.db.lock();
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     let mut stmt = conn
         .prepare("SELECT idx, title FROM chapters WHERE book_id = ?1 ORDER BY idx")
@@ -130,7 +130,7 @@ pub fn get_chapter_cmd(
     book_id: i64,
     idx: i64,
 ) -> Result<ChapterContent, String> {
-    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let guard = state.db.lock();
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     match get_chapter(conn, book_id, idx) {
         Ok(Some((title, content))) => Ok(ChapterContent {
@@ -175,3 +175,5 @@ mod tests {
         assert_eq!(decode_txt(&gbk), "中文");
     }
 }
+
+pub mod providers;

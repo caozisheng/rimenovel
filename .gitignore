@@ -25,3 +25,4 @@ dist-ssr
 
 # 设计文档仅本地保留，禁止提交
 docs/
+data/

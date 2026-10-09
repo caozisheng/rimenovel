@@ -15,8 +15,8 @@ pub mod llm;
 pub mod store;
 
 use commands::AppState;
+use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::sync::Mutex;
 
 fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
     let dir = app_data_dir()?;
@@ -43,7 +43,11 @@ pub fn run() {
             commands::import_book,
             commands::list_books_cmd,
             commands::get_chapter_titles,
-            commands::get_chapter_cmd
+            commands::get_chapter_cmd,
+            commands::providers::provider_save,
+            commands::providers::provider_list,
+            commands::providers::provider_delete,
+            commands::providers::provider_test
         ])
         .run(tauri::generate_context!())
         .expect("error while running rimenovel application");

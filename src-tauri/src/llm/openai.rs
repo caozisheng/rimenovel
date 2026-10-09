@@ -2,9 +2,7 @@
 // /chat/completions: 结构化(json_schema strict) + SSE 流式；Bearer 认证；
 // 429/5xx 指数退避 1 次；schema 校验失败 → prompt 内嵌 schema 降级重试 1 次。
 
-use crate::llm::{
-    ChatMessage, LlmClient, LlmError, ProviderConfig, StructuredRequest, TaskKind, TextRequest,
-};
+use crate::llm::{LlmClient, LlmError, ProviderConfig, StructuredRequest, TextRequest};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -21,7 +19,7 @@ impl OpenAiClient {
         format!("{}/chat/completions", base.trim_end_matches('/'))
     }
 
-    fn auth<'r>(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         rb.bearer_auth(&self.cfg.api_key)
     }
 
@@ -36,7 +34,10 @@ impl OpenAiClient {
                 .map_err(|e| LlmError::Network(e.to_string()))?;
             let status = resp.status();
             if status.is_success() {
-                return resp.json().await.map_err(|e| LlmError::Network(e.to_string()));
+                return resp
+                    .json()
+                    .await
+                    .map_err(|e| LlmError::Network(e.to_string()));
             }
             let body_txt = resp.text().await.unwrap_or_default();
             // 429/5xx 退避重试一次
@@ -45,7 +46,10 @@ impl OpenAiClient {
                 tokio::time::sleep(RETRY_BACKOFF).await;
                 continue;
             }
-            return Err(LlmError::Server { status: status.as_u16(), body: body_txt });
+            return Err(LlmError::Server {
+                status: status.as_u16(),
+                body: body_txt,
+            });
         }
     }
 }
@@ -132,7 +136,7 @@ impl LlmClient for OpenAiClient {
             "messages": messages,
         });
         let url = self.endpoint(&self.cfg.base_url);
-        let mut resp = self
+        let resp = self
             .auth(self.http.post(&url).json(&body))
             .send()
             .await
@@ -159,7 +163,10 @@ impl LlmClient for OpenAiClient {
                         return Ok(full);
                     }
                     if let Ok(ev) = serde_json::from_str::<Value>(data) {
-                        if let Some(d) = ev.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                        if let Some(d) = ev
+                            .pointer("/choices/0/delta/content")
+                            .and_then(Value::as_str)
+                        {
                             full.push_str(d);
                             on_delta(d);
                         }
@@ -174,7 +181,7 @@ impl LlmClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ChatMessage;
+    use crate::llm::{ChatMessage, TaskKind};
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -209,14 +216,22 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"response_format": {"type": "json_schema"}})))
+            .and(body_partial_json(
+                json!({"response_format": {"type": "json_schema"}}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
-        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let client = OpenAiClient {
+            cfg: cfg(server.uri()),
+            http: reqwest::Client::new(),
+        };
         let req = StructuredRequest {
             task: TaskKind::Extract,
-            messages: vec![ChatMessage { role: "user".into(), content: "抽取".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "抽取".into(),
+            }],
             schema: &schema(),
             schema_name: "test",
             temperature: 0.0,
@@ -231,7 +246,9 @@ mod tests {
         // 第一次: 返回不合 schema 的 JSON
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"response_format": {"type": "json_schema"}})))
+            .and(body_partial_json(
+                json!({"response_format": {"type": "json_schema"}}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{"message": {"content": "{\"wrong\": 1}"} }]
             })))
@@ -241,14 +258,22 @@ mod tests {
         // 第二次(降级 json_object): 合法
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"response_format": {"type": "json_object"}})))
+            .and(body_partial_json(
+                json!({"response_format": {"type": "json_object"}}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
-        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let client = OpenAiClient {
+            cfg: cfg(server.uri()),
+            http: reqwest::Client::new(),
+        };
         let req = StructuredRequest {
             task: TaskKind::Extract,
-            messages: vec![ChatMessage { role: "user".into(), content: "x".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "x".into(),
+            }],
             schema: &schema(),
             schema_name: "test",
             temperature: 0.0,
@@ -271,7 +296,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
-        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let client = OpenAiClient {
+            cfg: cfg(server.uri()),
+            http: reqwest::Client::new(),
+        };
         let body = json!({"model": "gpt-test", "messages": []});
         let v = client.post_with_retry(body).await.unwrap();
         assert!(v["choices"].is_array());
@@ -282,14 +310,23 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(wiremock::matchers::header("authorization", "Bearer sk-test"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer sk-test",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
-        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let client = OpenAiClient {
+            cfg: cfg(server.uri()),
+            http: reqwest::Client::new(),
+        };
         let req = StructuredRequest {
             task: TaskKind::Extract,
-            messages: vec![ChatMessage { role: "user".into(), content: "x".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "x".into(),
+            }],
             schema: &schema(),
             schema_name: "t",
             temperature: 0.0,
@@ -312,14 +349,20 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let client = OpenAiClient {
+            cfg: cfg(server.uri()),
+            http: reqwest::Client::new(),
+        };
         let got = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
         let sink = got.clone();
         let full = client
             .stream_text(
                 TextRequest {
                     task: TaskKind::Write,
-                    messages: vec![ChatMessage { role: "user".into(), content: "写".into() }],
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: "写".into(),
+                    }],
                     temperature: 0.8,
                     max_tokens: None,
                 },
