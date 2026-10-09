@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const CHAPTER_GRAPH_SCHEMA: &str = include_str!("../../schemas/chapter-graph.schema.json");
-pub const GLOBAL_GRAPH_SCHEMA: &str = include_str!("../../schemas/global-graph.schema.json");
+pub const CHAPTER_GRAPH_SCHEMA: &str = include_str!("../../../schemas/chapter-graph.schema.json");
+pub const GLOBAL_GRAPH_SCHEMA: &str = include_str!("../../../schemas/global-graph.schema.json");
 
 pub fn chapter_schema_json() -> serde_json::Value {
     serde_json::from_str(CHAPTER_GRAPH_SCHEMA).expect("chapter schema 内嵌合法")
@@ -285,3 +285,5 @@ mod tests {
         assert!(gs["properties"]["style_guide"].is_object());
     }
 }
+
+pub mod merge;
