@@ -3,8 +3,8 @@
 // disambig: MergeReport.conflicts → 每簇一次裁决调用(merge/keep/merge-into) → key 归并映射
 
 use crate::core::graph::merge::{Conflict, ConflictKind};
-use crate::core::graph::{EntityType, GlobalGraph};
-use crate::llm::{ChatMessage, ProviderConfig, StructuredRequest, TaskKind};
+use crate::core::graph::GlobalGraph;
+use crate::llm::{ChatMessage, StructuredRequest, TaskKind};
 use serde_json::{json, Value};
 
 /// reduce 调用的输出 schema（内嵌小 schema）
@@ -143,7 +143,6 @@ pub fn apply_merge_map(
 
 /// 冲突簇 → LLM 裁决（每簇一次调用）；返回归并映射。LLM 失败的簇保守 keep。
 pub async fn disambiguate(
-    cfg: &ProviderConfig,
     client: &dyn crate::llm::LlmClient,
     global: &GlobalGraph,
     conflicts: &[Conflict],
