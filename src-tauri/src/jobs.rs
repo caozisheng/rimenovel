@@ -70,13 +70,11 @@ pub fn enqueue(
         |r| r.get(0),
     )?;
     if active > 0 {
-        return conn
-            .query_row(
-                "SELECT id FROM jobs WHERE book_id=?1 AND kind=?2 AND state IN ('queued','running','paused') LIMIT 1",
-                params![book_id, kind.as_str()],
-                |r| r.get(0),
-            )
-            .map_err(Into::into);
+        return conn.query_row(
+            "SELECT id FROM jobs WHERE book_id=?1 AND kind=?2 AND state IN ('queued','running','paused') LIMIT 1",
+            params![book_id, kind.as_str()],
+            |r| r.get(0),
+        );
     }
     conn.execute(
         "INSERT INTO jobs (book_id, kind, state, progress, payload_json) VALUES (?1, ?2, 'queued', 0, ?3)",
