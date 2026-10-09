@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri Windows bundle
+        run: pnpm tauri build
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $dest = "release-artifacts"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $bundle = Get-ChildItem -Recurse -Path "src-tauri/target/release/bundle" -File
+          if (-not $bundle) { throw "no bundle artifacts found" }
+          $bundle | ForEach-Object {
+            if ($_.Name -notmatch "\.(exe|msi)$") { return }
+            Copy-Item $_.FullName -Destination $dest
+          }
+          Get-ChildItem $dest
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rimenovel-windows-${{ github.ref_name }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-artifacts/*

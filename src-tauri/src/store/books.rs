@@ -64,9 +64,8 @@ pub fn create_book_with_chapters(
 }
 
 pub fn list_books(conn: &Connection) -> rusqlite::Result<Vec<Book>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, author, format, source_path FROM books ORDER BY id DESC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, title, author, format, source_path FROM books ORDER BY id DESC")?;
     let rows = stmt.query_map([], |r| {
         Ok(Book {
             id: r.get(0)?,
@@ -130,7 +129,12 @@ mod tests {
     fn create_and_list_books() {
         let conn = db_with_book();
         let id = create_book_with_chapters(
-            &conn, "武动乾坤", Some("天蚕土豆"), "txt", "/tmp/wu.txt", &fixture_chapters(),
+            &conn,
+            "武动乾坤",
+            Some("天蚕土豆"),
+            "txt",
+            "/tmp/wu.txt",
+            &fixture_chapters(),
         )
         .unwrap();
         assert!(id > 0);
@@ -144,7 +148,12 @@ mod tests {
     fn batch_insert_is_atomic() {
         let conn = db_with_book();
         let mut bad = fixture_chapters();
-        bad.push(NewChapter { idx: 1, title: "重复idx触发UNIQUE失败".into(), text: "x".into(), token_est: 1 });
+        bad.push(NewChapter {
+            idx: 1,
+            title: "重复idx触发UNIQUE失败".into(),
+            text: "x".into(),
+            token_est: 1,
+        });
         let err = create_book_with_chapters(&conn, "坏书", None, "txt", "/tmp/bad.txt", &bad);
         assert!(err.is_err());
         // 回滚干净：书架为空
@@ -154,7 +163,8 @@ mod tests {
     #[test]
     fn get_chapter_hit_and_miss() {
         let conn = db_with_book();
-        let id = create_book_with_chapters(&conn, "书", None, "txt", "/x", &fixture_chapters()).unwrap();
+        let id =
+            create_book_with_chapters(&conn, "书", None, "txt", "/x", &fixture_chapters()).unwrap();
         let (title, text) = get_chapter(&conn, id, 2).unwrap().unwrap();
         assert_eq!(title, "第2章");
         assert!(text.contains("第2章正文"));

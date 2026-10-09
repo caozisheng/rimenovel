@@ -37,8 +37,7 @@ impl<'a> Db<'a> {
             self.conn.execute_batch("BEGIN")?;
             match self.conn.execute_batch(sql) {
                 Ok(_) => {
-                    self.conn
-                        .pragma_update(None, "user_version", version)?;
+                    self.conn.pragma_update(None, "user_version", version)?;
                     self.conn.execute_batch("COMMIT")?;
                 }
                 Err(e) => {
@@ -66,11 +65,15 @@ mod tests {
         let conn = mem_db();
         let db = Db::new(&conn);
         db.migrate().unwrap();
-        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert!(v >= 1);
         // 幂等：重复执行不报错、版本不变
         db.migrate().unwrap();
-        let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v2: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, v2);
     }
 
@@ -79,9 +82,20 @@ mod tests {
         let conn = mem_db();
         Db::new(&conn).migrate().unwrap();
         let expected = [
-            "books", "chapters", "generated_chapters", "edits_log", "reader_intent",
-            "directives", "graph_nodes", "graph_edges", "graph_events",
-            "chapter_graph_meta", "jobs", "llm_providers", "llm_cache", "llm_usage",
+            "books",
+            "chapters",
+            "generated_chapters",
+            "edits_log",
+            "reader_intent",
+            "directives",
+            "graph_nodes",
+            "graph_edges",
+            "graph_events",
+            "chapter_graph_meta",
+            "jobs",
+            "llm_providers",
+            "llm_cache",
+            "llm_usage",
         ];
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -98,7 +112,10 @@ mod tests {
             .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")
             .unwrap();
         let idx_count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
-        assert!(idx_count >= 9, "expected >=9 custom indexes, got {idx_count}");
+        assert!(
+            idx_count >= 9,
+            "expected >=9 custom indexes, got {idx_count}"
+        );
     }
 }
 pub mod books;

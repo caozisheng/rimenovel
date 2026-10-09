@@ -30,7 +30,18 @@ fn strip_html(html: &str) -> String {
     let mut s = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut tag_buf = String::new();
-    const BLOCK: &[&str] = &["p", "div", "h1", "h2", "h3", "h4", "br", "li", "tr", "blockquote"];
+    const BLOCK: &[&str] = &[
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "br",
+        "li",
+        "tr",
+        "blockquote",
+    ];
     for c in html.chars() {
         match c {
             '<' => {
@@ -135,7 +146,11 @@ pub fn split_epub(data: &[u8], opts: &SplitOptions) -> Result<Vec<RawChapter>, S
                 .unwrap_or("无题")
                 .trim()
                 .to_string();
-            chapters.push(RawChapter { idx: 0, title, text });
+            chapters.push(RawChapter {
+                idx: 0,
+                title,
+                text,
+            });
         }
     }
     for (i, ch) in chapters.iter_mut().enumerate() {
@@ -154,12 +169,24 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut w = zip::ZipWriter::new(&mut buf);
-            w.start_file("META-INF/container.xml", zip::write::SimpleFileOptions::default()).unwrap();
+            w.start_file(
+                "META-INF/container.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             w.write_all(br#"<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
-            w.start_file("OEBPS/content.opf", zip::write::SimpleFileOptions::default()).unwrap();
+            w.start_file(
+                "OEBPS/content.opf",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
             w.write_all(br#"<?xml version="1.0"?><package xmlns:opf="http://www.idpf.org/2007/opf"><manifest><item id="c1" href="c1.xhtml"/><item id="c2" href="c2.xhtml"/><item id="c3" href="c3.xhtml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/><itemref idref="c3"/></spine></package>"#).unwrap();
             for i in 1..=3 {
-                w.start_file(format!("OEBPS/c{i}.xhtml"), zip::write::SimpleFileOptions::default()).unwrap();
+                w.start_file(
+                    format!("OEBPS/c{i}.xhtml"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
                 let html = format!(
                     "<html><body><h1>第{i}章 试炼</h1><p>第{i}章正文内容。</p></body></html>"
                 );

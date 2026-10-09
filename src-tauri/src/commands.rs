@@ -21,7 +21,12 @@ fn raw_to_new(rc: Vec<RawChapter>) -> Vec<NewChapter> {
     rc.into_iter()
         .map(|c| {
             let est = token_est(&c.text);
-            NewChapter { idx: c.idx, title: c.title, text: c.text, token_est: est }
+            NewChapter {
+                idx: c.idx,
+                title: c.title,
+                text: c.text,
+                token_est: est,
+            }
         })
         .collect()
 }
@@ -40,13 +45,17 @@ pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, S
     let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
     let opts = SplitOptions::default();
 
-    let (format, chapters) = match p.extension().and_then(|e| e.to_str()).map(str::to_lowercase) {
+    let (format, chapters) = match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+    {
         Some(ext) if ext == "txt" => {
             let text = decode_txt(&bytes);
             ("txt", raw_to_new(split_txt(&text, &opts)))
         }
         Some(ext) if ext == "epub" => {
-            let cs = crate::core::epub::split_epub(&bytes, &opts).map_err(|e| e)?;
+            let cs = crate::core::epub::split_epub(&bytes, &opts)?;
             ("epub", raw_to_new(cs))
         }
         _ => return Err("仅支持 txt/epub".into()),
@@ -71,7 +80,9 @@ fn decode_txt(bytes: &[u8]) -> String {
 }
 
 #[tauri::command]
-pub fn list_books_cmd(state: tauri::State<AppState>) -> Result<Vec<crate::store::books::Book>, String> {
+pub fn list_books_cmd(
+    state: tauri::State<AppState>,
+) -> Result<Vec<crate::store::books::Book>, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     list_books(conn).map_err(|e| e.to_string())
@@ -84,16 +95,25 @@ pub struct ChapterMeta {
 }
 
 #[tauri::command]
-pub fn get_chapter_titles(state: tauri::State<AppState>, book_id: i64) -> Result<Vec<ChapterMeta>, String> {
+pub fn get_chapter_titles(
+    state: tauri::State<AppState>,
+    book_id: i64,
+) -> Result<Vec<ChapterMeta>, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     let mut stmt = conn
         .prepare("SELECT idx, title FROM chapters WHERE book_id = ?1 ORDER BY idx")
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([book_id], |r| Ok(ChapterMeta { idx: r.get(0)?, title: r.get(1)? }))
+        .query_map([book_id], |r| {
+            Ok(ChapterMeta {
+                idx: r.get(0)?,
+                title: r.get(1)?,
+            })
+        })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -105,11 +125,20 @@ pub struct ChapterContent {
 }
 
 #[tauri::command]
-pub fn get_chapter_cmd(state: tauri::State<AppState>, book_id: i64, idx: i64) -> Result<ChapterContent, String> {
+pub fn get_chapter_cmd(
+    state: tauri::State<AppState>,
+    book_id: i64,
+    idx: i64,
+) -> Result<ChapterContent, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     match get_chapter(conn, book_id, idx) {
-        Ok(Some((title, content))) => Ok(ChapterContent { idx, title, content, source: "original".into() }),
+        Ok(Some((title, content))) => Ok(ChapterContent {
+            idx,
+            title,
+            content,
+            source: "original".into(),
+        }),
         Ok(None) => Err(format!("章节不存在: {idx}")),
         Err(e) => Err(e.to_string()),
     }
@@ -127,7 +156,15 @@ mod tests {
 
     #[test]
     fn derive_title_contains_chapter_count() {
-        let t = derive_title(Path::new("/books/武动乾坤.txt"), &[NewChapter { idx: 1, title: "a".into(), text: "t".into(), token_est: 1 }]);
+        let t = derive_title(
+            Path::new("/books/武动乾坤.txt"),
+            &[NewChapter {
+                idx: 1,
+                title: "a".into(),
+                text: "t".into(),
+                token_est: 1,
+            }],
+        );
         assert!(t.contains("武动乾坤") && t.contains("1章"));
     }
 

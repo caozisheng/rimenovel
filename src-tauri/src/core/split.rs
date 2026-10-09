@@ -19,7 +19,10 @@ pub struct SplitOptions {
 
 impl Default for SplitOptions {
     fn default() -> Self {
-        Self { max_title_len: 40, min_matches: 2 }
+        Self {
+            max_title_len: 40,
+            min_matches: 2,
+        }
     }
 }
 
@@ -66,7 +69,11 @@ pub fn split_txt(text: &str, opts: &SplitOptions) -> Vec<RawChapter> {
         Some(c) => c,
         // 无规则达标：整书一章
         None => {
-            return vec![RawChapter { idx: 1, title: "正文".into(), text: text.to_string() }];
+            return vec![RawChapter {
+                idx: 1,
+                title: "正文".into(),
+                text: text.to_string(),
+            }];
         }
     };
     let _ = pattern_idx;
@@ -75,10 +82,14 @@ pub fn split_txt(text: &str, opts: &SplitOptions) -> Vec<RawChapter> {
     let mut chapters: Vec<RawChapter> = Vec::new();
     let first_hit = hits.iter().position(|&h| h).unwrap();
     if first_hit > 0 {
-        let preface: Vec<&str> = lines[..first_hit].iter().copied().collect();
+        let preface: Vec<&str> = lines[..first_hit].to_vec();
         let preface_text = preface.join("\n").trim().to_string();
         if !preface_text.is_empty() {
-            chapters.push(RawChapter { idx: 1, title: "前言".into(), text: preface_text });
+            chapters.push(RawChapter {
+                idx: 1,
+                title: "前言".into(),
+                text: preface_text,
+            });
         }
     }
 
@@ -87,7 +98,11 @@ pub fn split_txt(text: &str, opts: &SplitOptions) -> Vec<RawChapter> {
     for (i, line) in lines.iter().enumerate() {
         if hits.get(i).copied().unwrap_or(false) {
             if let Some((title, body)) = current.take() {
-                chapters.push(RawChapter { idx: 0, title, text: body.join("\n").trim().to_string() });
+                chapters.push(RawChapter {
+                    idx: 0,
+                    title,
+                    text: body.join("\n").trim().to_string(),
+                });
             }
             current = Some((line.trim().to_string(), Vec::new()));
         } else if let Some((_, body)) = current.as_mut() {
@@ -95,7 +110,11 @@ pub fn split_txt(text: &str, opts: &SplitOptions) -> Vec<RawChapter> {
         }
     }
     if let Some((title, body)) = current.take() {
-        chapters.push(RawChapter { idx: 0, title, text: body.join("\n").trim().to_string() });
+        chapters.push(RawChapter {
+            idx: 0,
+            title,
+            text: body.join("\n").trim().to_string(),
+        });
     }
 
     // 序号按出现顺序重编
@@ -128,7 +147,13 @@ mod tests {
         assert_eq!(cs[0].title, "第一百二十三章 破境");
 
         let txt2 = "第12卷 天骄\nA\n第13卷 峥嵘\nB\n";
-        let cs2 = split_txt(txt2, &SplitOptions { min_matches: 2, ..Default::default() });
+        let cs2 = split_txt(
+            txt2,
+            &SplitOptions {
+                min_matches: 2,
+                ..Default::default()
+            },
+        );
         assert_eq!(cs2.len(), 2);
     }
 
@@ -158,7 +183,13 @@ mod tests {
 
         // 长行（疑似正文段）即使命中正则也不当标题
         let txt2 = "第二章的事情他说了很多很多很多很多很多很多很多很多很多很长的正文段落内容超长。\n正文。\n第一章 起点\nA\n第二章 风波\nB\n";
-        let cs2 = split_txt(txt2, &SplitOptions { max_title_len: 40, ..Default::default() });
+        let cs2 = split_txt(
+            txt2,
+            &SplitOptions {
+                max_title_len: 40,
+                ..Default::default()
+            },
+        );
         assert_eq!(cs2.len(), 3, "长行被忽略: {cs2:?}");
     }
 
