@@ -1,10 +1,12 @@
 <script setup lang="ts">
-// RimeNovel 书架（P2 雏形：导入 + 列表）
+// RimeNovel 入口：书架 ↔ 阅读器（后续里程碑逐步加入图谱工作台/时间线）
 import { onMounted, ref } from "vue";
 import type { Book } from "./lib/types";
+import ReaderView from "./components/ReaderView.vue";
 import { importBook, listBooks, pickNovelFile } from "./lib/ipc";
 
 const books = ref<Book[]>([]);
+const activeBookId = ref<number | null>(null);
 const importing = ref(false);
 const error = ref("");
 
@@ -33,7 +35,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <main class="bookshelf">
+  <ReaderView v-if="activeBookId !== null" :book-id="activeBookId" @back="activeBookId = null" />
+  <main v-else class="bookshelf">
     <header class="shelf-header">
       <h1>RimeNovel</h1>
       <button :disabled="importing" @click="onImport">
@@ -42,7 +45,7 @@ onMounted(async () => {
     </header>
     <p v-if="error" class="error">{{ error }}</p>
     <ul v-if="books.length" class="book-list">
-      <li v-for="b in books" :key="b.id" class="book-card">
+      <li v-for="b in books" :key="b.id" class="book-card" @click="activeBookId = b.id">
         <span class="title">{{ b.title }}</span>
         <span class="meta">{{ b.author ?? "佚名" }} · {{ b.format }}</span>
       </li>
@@ -55,7 +58,8 @@ onMounted(async () => {
 .bookshelf { max-width: 720px; margin: 0 auto; padding: 24px; }
 .shelf-header { display: flex; justify-content: space-between; align-items: center; }
 .book-list { list-style: none; padding: 0; display: grid; gap: 12px; }
-.book-card { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; }
+.book-card { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; cursor: pointer; }
+.book-card:hover { border-color: #888c; }
 .title { font-weight: 600; }
 .meta { color: #888; font-size: 0.9em; }
 .empty { color: #888; }

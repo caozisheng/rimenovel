@@ -39,7 +39,9 @@ pub fn run() {
         .manage(AppState { db: Mutex::new(Some(db)) })
         .invoke_handler(tauri::generate_handler![
             commands::import_book,
-            commands::list_books_cmd
+            commands::list_books_cmd,
+            commands::get_chapter_titles,
+            commands::get_chapter_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running rimenovel application");

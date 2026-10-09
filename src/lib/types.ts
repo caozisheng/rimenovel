@@ -6,3 +6,15 @@ export interface Book {
   format: string;
   source_path: string;
 }
+
+export interface ChapterMeta {
+  idx: number;
+  title: string;
+}
+
+export interface ChapterContent {
+  idx: number;
+  title: string;
+  content: string;
+  source: string;
+}

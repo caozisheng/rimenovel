@@ -1,8 +1,8 @@
-// IPC commands（薄层，dev-plan Task 2.3）
+// IPC commands（薄层，dev-plan Task 2.3/2.4）
 // 业务在 core/store，此处只做参数分派与状态桥接。
 
 use crate::core::split::{split_txt, RawChapter, SplitOptions};
-use crate::store::books::{create_book_with_chapters, list_books, NewChapter};
+use crate::store::books::{create_book_with_chapters, get_chapter, list_books, NewChapter};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
@@ -62,7 +62,7 @@ pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, S
         .map_err(|e| format!("入库失败: {e}"))
 }
 
-/// txt 编码探测：优先 UTF-8，回退 GBK（windows-1252 不可靠，中文书常见 GBK）。
+/// txt 编码探测：优先 UTF-8，回退 GBK（中文书常见）。
 fn decode_txt(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
@@ -75,6 +75,44 @@ pub fn list_books_cmd(state: tauri::State<AppState>) -> Result<Vec<crate::store:
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
     list_books(conn).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct ChapterMeta {
+    pub idx: i64,
+    pub title: String,
+}
+
+#[tauri::command]
+pub fn get_chapter_titles(state: tauri::State<AppState>, book_id: i64) -> Result<Vec<ChapterMeta>, String> {
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_ref().ok_or("数据库未初始化")?;
+    let mut stmt = conn
+        .prepare("SELECT idx, title FROM chapters WHERE book_id = ?1 ORDER BY idx")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([book_id], |r| Ok(ChapterMeta { idx: r.get(0)?, title: r.get(1)? }))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct ChapterContent {
+    pub idx: i64,
+    pub title: String,
+    pub content: String,
+    pub source: String, // M1 阶段恒 "original"；阅读线接入后按 source(n) 解析
+}
+
+#[tauri::command]
+pub fn get_chapter_cmd(state: tauri::State<AppState>, book_id: i64, idx: i64) -> Result<ChapterContent, String> {
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = guard.as_ref().ok_or("数据库未初始化")?;
+    match get_chapter(conn, book_id, idx) {
+        Ok(Some((title, content))) => Ok(ChapterContent { idx, title, content, source: "original".into() }),
+        Ok(None) => Err(format!("章节不存在: {idx}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]
