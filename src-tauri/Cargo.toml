@@ -1,0 +1,33 @@
+[package]
+name = "rimenovel"
+version = "0.1.0"
+description = "RimeNovel — 可干预知识图谱的 AI 连载小说阅读器"
+authors = ["RimeNovel"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "rimenovel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex = "1.13.1"
+zip = "9.0.0"
+encoding_rs = "0.8.42"
+tauri-plugin-dialog = "2.8.1"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
