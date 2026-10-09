@@ -47,7 +47,8 @@ pub fn run() {
             commands::providers::provider_save,
             commands::providers::provider_list,
             commands::providers::provider_delete,
-            commands::providers::provider_test
+            commands::providers::provider_test,
+            commands::status::get_extraction_statuses
         ])
         .run(tauri::generate_context!())
         .expect("error while running rimenovel application");
