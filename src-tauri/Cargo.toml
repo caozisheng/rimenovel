@@ -23,6 +23,14 @@ regex = "1.13.1"
 zip = "9.0.0"
 encoding_rs = "0.8.42"
 tauri-plugin-dialog = "2.8.1"
+async-trait = "0.1.92"
+jsonschema = "0.58.6"
+thiserror = "2.0.21"
+reqwest = { version = "0.13.5", features = ["json", "stream"] }
+parking_lot = "0.12.5"
+futures-util = "0.3.34"
+tokio = { version = "1.53.2", features = ["time", "rt", "macros"] }
+sha2 = "0.11.0"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -31,3 +39,6 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+wiremock = "0.6.5"
