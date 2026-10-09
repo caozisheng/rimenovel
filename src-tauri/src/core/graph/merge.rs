@@ -156,7 +156,7 @@ pub fn merge_window(acc: &mut GlobalGraph, w: &ChapterGraph) -> MergeReport {
     // ── relations ────────────────────────────────────────────
     // 幂等键: (src, dst, rel_category)——同对同类不重复; 状态取最新窗口; since 取首现
     let resolve = |k: &str| -> Option<String> {
-        if window_keys.contains(k) || acc.entities.iter().any(|e| &e.key == k) {
+        if window_keys.contains(k) || acc.entities.iter().any(|e| e.key == k) {
             Some(k.to_string())
         } else {
             None
@@ -260,7 +260,7 @@ fn recompute_importance(acc: &mut GlobalGraph) {
             }
         }
         for ev in &acc.events {
-            if ev.participants.iter().any(|p| *p == e.key) {
+            if ev.participants.contains(&e.key) {
                 seen.push(ev.chapter_idx);
             }
         }
@@ -277,7 +277,7 @@ fn recompute_importance(acc: &mut GlobalGraph) {
         let events = acc
             .events
             .iter()
-            .filter(|ev| ev.participants.iter().any(|p| *p == e.key))
+            .filter(|ev| ev.participants.contains(&e.key))
             .count() as i64;
         let score = span + degree * 2 + events * 3;
         let importance = if score >= 15 {
@@ -306,7 +306,7 @@ fn recompute_importance(acc: &mut GlobalGraph) {
             }
         }
         for ev in &acc.events {
-            if ev.participants.iter().any(|p| *p == e.key) {
+            if ev.participants.contains(&e.key) {
                 seen.push(ev.chapter_idx);
             }
         }
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn relation_status_takes_latest_window() {
         let mut acc = GlobalGraph::default();
-        let e = [("lin-dong", "lin-xiao"), ("lin-dong", "lin-xiao")];
+        let _e = [("lin-dong", "lin-xiao"), ("lin-dong", "lin-xiao")];
         let ents = [("lin-dong", "林动"), ("lin-xiao", "林啸")];
         merge_window(
             &mut acc,
