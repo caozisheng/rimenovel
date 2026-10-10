@@ -3,7 +3,7 @@
 // 头: x-api-key + anthropic-version; 429/5xx 退避 1 次; schema 失败 → 内嵌降级 1 次。
 
 use crate::llm::{
-    ChatMessage, LlmClient, LlmError, ProviderConfig, StructuredRequest, TextRequest,
+    combined_usage, reported_usage, ChatMessage, LlmClient, LlmError, ProviderConfig, StructuredRequest, StructuredResponse, TextRequest,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -108,6 +108,10 @@ impl AnthropicClient {
 #[async_trait]
 impl LlmClient for AnthropicClient {
     async fn structured(&self, req: StructuredRequest<'_>) -> Result<Value, LlmError> {
+        Ok(self.structured_with_usage(req).await?.value)
+    }
+
+    async fn structured_with_usage(&self, req: StructuredRequest<'_>) -> Result<StructuredResponse, LlmError> {
         let model = self.cfg.model_for(req.task)?.to_string();
         let (system, msgs) = Self::split_messages(&req.messages);
 
@@ -127,11 +131,12 @@ impl LlmClient for AnthropicClient {
             body["system"] = json!(sys);
         }
         let resp = self.post_with_retry(body).await?;
+        let usage = reported_usage(&resp, "input_tokens", "output_tokens");
         let parsed =
             Self::tool_input(&resp).ok_or_else(|| LlmError::Stream("响应缺 tool_use 块".into()))?;
         let validator = crate::llm::compile_schema(req.schema);
         if validator.validate(&parsed).is_ok() {
-            return Ok(parsed);
+            return Ok(StructuredResponse { value:parsed, usage });
         }
 
         // 降级：去掉 tool_choice 强制，system 内嵌 schema 指示直接输出 JSON 文本
@@ -153,7 +158,7 @@ impl LlmClient for AnthropicClient {
         validator
             .validate(&parsed2)
             .map_err(|e| LlmError::Schema(e.to_string()))?;
-        Ok(parsed2)
+        Ok(StructuredResponse { value:parsed2, usage:combined_usage(usage,reported_usage(&resp2,"input_tokens","output_tokens")) })
     }
 
     async fn stream_text(
@@ -198,6 +203,9 @@ impl LlmClient for AnthropicClient {
                 if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim();
                     if let Ok(ev) = serde_json::from_str::<Value>(data) {
+                        if let Some(reason) = ev.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                            if !matches!(reason, "end_turn" | "stop_sequence") { return Err(LlmError::Stream(format!("generation ended with {reason}"))); }
+                        }
                         let is_stop = ev["type"].as_str() == Some("message_stop");
                         if is_stop {
                             return Ok(full);
@@ -209,7 +217,7 @@ impl LlmClient for AnthropicClient {
                 }
             }
         }
-        Ok(full)
+        Err(LlmError::Stream("generation ended before message_stop".into()))
     }
 }
 
@@ -286,6 +294,22 @@ mod tests {
         };
         let v = client.structured(req).await.unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn structured_preserves_reported_token_usage() {
+        let server = MockServer::start().await;
+        let mut body = tool_use_body();
+        body["usage"] = json!({"input_tokens": 127, "output_tokens": 31});
+        Mock::given(method("POST")).and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&server).await;
+        let client = AnthropicClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let shape = schema();
+        let response = client.structured_with_usage(StructuredRequest {
+            task: TaskKind::Extract, messages: vec![], schema:&shape, schema_name:"test", temperature:0.0,
+        }).await.unwrap();
+        assert_eq!(response.usage, Some((127,31)));
+        assert_eq!(response.value["ok"], true);
     }
 
     #[tokio::test]
@@ -390,5 +414,16 @@ mod tests {
             .unwrap();
         assert_eq!(full, "山雨欲来");
         assert_eq!(*got.lock(), "山雨欲来");
+    }
+
+    #[tokio::test]
+    async fn truncated_sse_is_not_a_successful_chapter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"half\"}}\n\n"))
+            .mount(&server).await;
+        let client = AnthropicClient {cfg:cfg(server.uri()),http:reqwest::Client::new()};
+        let result = client.stream_text(TextRequest {task:TaskKind::Write,messages:vec![],temperature:0.8,max_tokens:None},std::sync::Arc::new(|_|{})).await;
+        assert!(matches!(result,Err(LlmError::Stream(_))));
     }
 }

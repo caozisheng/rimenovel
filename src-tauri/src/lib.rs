@@ -17,9 +17,9 @@ pub mod store;
 use commands::AppState;
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use tauri::Manager;
 
-fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
-    let dir = app_data_dir()?;
+fn init_db(dir: &std::path::Path) -> Result<Connection, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
     let conn = Connection::open(dir.join("rimenovel.db"))?;
     store::Db::apply_pragmas(&conn)?;
@@ -27,17 +27,35 @@ fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
     Ok(conn)
 }
 
-fn app_data_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    // Tauri 运行期用 app.path().app_data_dir()；此处为测试/CLI 兜底
-    Ok(std::env::current_dir()?.join("data"))
-}
 pub fn run() {
-    let db = init_db().expect("数据库初始化失败");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            db: Mutex::new(Some(db)),
+            db: Mutex::new(None),
+        })
+        .setup(|app| {
+            let dir = match std::env::var_os("RIMENOVEL_DATA_DIR") {
+                Some(path) => std::path::PathBuf::from(path),
+                None => app.path().app_data_dir()?,
+            };
+            std::fs::create_dir_all(&dir)?;
+            // Preserve pre-cutover local data once, without overwriting an
+            // installed database or discarding SQLite's committed WAL pages.
+            let legacy = std::env::current_dir()?.join("data");
+            let target = dir.join("rimenovel.db");
+            if !target.exists() && legacy.join("rimenovel.db").exists() && legacy != dir {
+                let source = Connection::open(legacy.join("rimenovel.db"))?;
+                source.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+                let old_creds = legacy.join("creds.json");
+                if old_creds.exists() && !dir.join("creds.json").exists() {
+                    std::fs::copy(old_creds, dir.join("creds.json"))?;
+                }
+            }
+            creds::configure_directory(dir.clone()).map_err(std::io::Error::other)?;
+            *app.state::<AppState>().db.lock() = Some(init_db(&dir).map_err(|e| std::io::Error::other(e.to_string()))?);
+            commands::kg::resume_jobs(app.handle()).map_err(std::io::Error::other)?;
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::import_book,
@@ -49,7 +67,15 @@ pub fn run() {
             commands::providers::provider_list,
             commands::providers::provider_delete,
             commands::providers::provider_test,
-            commands::status::get_extraction_statuses
+            commands::status::get_extraction_statuses,
+            commands::kg::get_graph,
+            commands::kg::get_graph_evidence,
+            commands::kg::reveal_graph,
+            commands::kg::apply_graph_edit,
+            commands::kg::revert_graph_edit,
+            commands::kg::list_graph_edits,
+            commands::kg::start_book_extraction,
+            commands::kg::extract_chapter_graph
         ])
         .run(tauri::generate_context!())
         .expect("error while running rimenovel application");

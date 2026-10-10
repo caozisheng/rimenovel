@@ -69,12 +69,37 @@ pub enum LlmError {
     Config(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct StructuredResponse {
+    pub value: Value,
+    pub usage: Option<(i64, i64)>,
+}
+
+pub(crate) fn reported_usage(response:&Value, input_key:&str, output_key:&str) -> Option<(i64,i64)> {
+    let usage = response.get("usage")?;
+    let input = usage.get(input_key)?.as_i64()?;
+    let output = usage.get(output_key)?.as_i64()?;
+    (input >= 0 && output >= 0).then_some((input,output))
+}
+
+pub(crate) fn combined_usage(left:Option<(i64,i64)>, right:Option<(i64,i64)>) -> Option<(i64,i64)> {
+    match (left,right) {
+        (Some((li,lo)),Some((ri,ro))) => Some((li + ri,lo + ro)),
+        _ => None,
+    }
+}
+
 /// 协议客户端抽象：openai.rs / anthropic.rs 各自实现
 #[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
     /// 结构化输出：协议实现负责请求组装、响应解析、jsonschema 校验、
     /// 失败重试 1 次、降级 prompt 内嵌 schema 再 1 次（实现侧约定）。
     async fn structured(&self, req: StructuredRequest<'_>) -> Result<Value, LlmError>;
+
+    /// Implementations that receive provider usage override this without extra requests.
+    async fn structured_with_usage(&self, req:StructuredRequest<'_>) -> Result<StructuredResponse,LlmError> {
+        Ok(StructuredResponse { value:self.structured(req).await?, usage:None })
+    }
 
     /// 流式正文生成：on_delta 逐块回调（token 流透传到前端 event）。
     /// Arc<dyn Fn> 避免 async_trait 脱糖下 &dyn Fn(&str) 的 HRTB 生命周期冲突。

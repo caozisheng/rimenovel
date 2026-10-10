@@ -40,7 +40,7 @@ fn derive_title(path: &Path, chapters: &[NewChapter]) -> String {
 }
 
 #[tauri::command]
-pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, String> {
+pub fn import_book(app: tauri::AppHandle, state: tauri::State<AppState>, path: String) -> Result<i64, String> {
     let p = Path::new(&path);
     let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
     let opts = SplitOptions::default();
@@ -65,10 +65,14 @@ pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, S
     }
     let title = derive_title(p, &chapters);
 
-    let mut guard = state.db.lock();
-    let conn = guard.as_mut().ok_or("数据库未初始化")?;
-    create_book_with_chapters(conn, &title, None, format, &path, &chapters)
-        .map_err(|e| format!("入库失败: {e}"))
+    let id = {
+        let mut guard = state.db.lock();
+        let conn = guard.as_mut().ok_or("数据库未初始化")?;
+        create_book_with_chapters(conn, &title, None, format, &path, &chapters)
+            .map_err(|e| format!("入库失败: {e}"))?
+    };
+    kg::schedule_book(app, id, None)?;
+    Ok(id)
 }
 
 #[tauri::command]
@@ -128,27 +132,60 @@ pub struct ChapterContent {
     pub idx: i64,
     pub title: String,
     pub content: String,
-    pub source: String, // M1 阶段恒 "original"；阅读线接入后按 source(n) 解析
+    pub source: String, // selected immutable original/generated text version
+    pub graph_error: Option<String>,
 }
 
 #[tauri::command]
-pub fn get_chapter_cmd(
-    state: tauri::State<AppState>,
+pub async fn get_chapter_cmd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     book_id: i64,
     idx: i64,
 ) -> Result<ChapterContent, String> {
-    let guard = state.db.lock();
-    let conn = guard.as_ref().ok_or("数据库未初始化")?;
-    match get_chapter(conn, book_id, idx) {
-        Ok(Some((title, content))) => Ok(ChapterContent {
-            idx,
-            title,
-            content,
-            source: "original".into(),
-        }),
-        Ok(None) => Err(format!("章节不存在: {idx}")),
-        Err(e) => Err(e.to_string()),
+    let (title, original, needs_generation, line_version) = {
+        let guard = state.db.lock();
+        let conn = guard.as_ref().ok_or("数据库未初始化")?;
+        let generated = crate::store::kg::divergence(conn, book_id)?.is_some_and(|from| idx >= from);
+        let (title, text) = if generated {
+            let title = conn.query_row("SELECT title FROM chapters WHERE book_id=?1 AND idx=?2", rusqlite::params![book_id, idx], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            (title, String::new())
+        } else {
+            get_chapter(conn, book_id, idx).map_err(|e| e.to_string())?.ok_or_else(|| format!("章节不存在: {idx}"))?
+        };
+        (title, text, generated, crate::store::kg::line_version(conn, book_id)?)
+    };
+    let mut graph_error = None;
+    let (content, source) = if needs_generation {
+        let selected = match kg::ensure_selected(&app, &state, book_id, idx, None).await {
+            Ok(text) => text,
+            Err(error) if crate::core::kg_generate::completed_stage_error(&error) => {
+                let saved = {
+                    let guard = state.db.lock();
+                    crate::core::kg_generate::saved_readable_after_stage_error(
+                        guard.as_ref().ok_or("数据库未初始化")?, book_id, idx, line_version,
+                    )?
+                }.ok_or_else(|| error.clone())?;
+                graph_error = Some(error);
+                saved
+            }
+            Err(error) => return Err(error),
+        };
+        (selected.content, selected.source)
+    } else {
+        (original, "original".into())
+    };
+    {
+        let guard = state.db.lock();
+        let conn = guard.as_ref().ok_or("数据库未初始化")?;
+        if crate::store::kg::line_version(conn, book_id)? != line_version {
+            return Err("阅读线已变化，请重新打开本章".into());
+        }
+        crate::store::kg::mark_read(conn, book_id, idx)?;
     }
+    kg::prefetch_next(app, book_id);
+    Ok(ChapterContent { idx, title, content, source, graph_error })
 }
 
 #[cfg(test)]
@@ -186,3 +223,4 @@ mod tests {
 pub mod providers;
 
 pub mod status;
+pub mod kg;

@@ -16,6 +16,8 @@ pub struct ProviderRow {
     pub model_extract: Option<String>,
     pub model_write: Option<String>,
     pub model_merge: Option<String>,
+    pub context_limit: Option<usize>,
+    pub output_reserve: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,11 +29,14 @@ pub struct ProviderInput {
     pub model_write: Option<String>,
     pub model_merge: Option<String>,
     pub api_key: String,
+    pub context_limit: Option<usize>,
+    pub output_reserve: Option<usize>,
 }
 
 fn row_from(conn: &Connection, id: i64) -> rusqlite::Result<Option<ProviderRow>> {
     conn.query_row(
-        "SELECT id, name, protocol, base_url, model_extract, model_write, model_merge
+        "SELECT id, name, protocol, base_url, model_extract, model_write, model_merge,
+         json_extract(params_json,'$.context_limit'),json_extract(params_json,'$.output_reserve')
          FROM llm_providers WHERE id = ?1",
         [id],
         |r| {
@@ -43,6 +48,8 @@ fn row_from(conn: &Connection, id: i64) -> rusqlite::Result<Option<ProviderRow>>
                 model_extract: r.get(4)?,
                 model_write: r.get(5)?,
                 model_merge: r.get(6)?,
+                context_limit: r.get(7)?,
+                output_reserve: r.get(8)?,
             })
         },
     )
@@ -53,7 +60,7 @@ fn row_from(conn: &Connection, id: i64) -> rusqlite::Result<Option<ProviderRow>>
     })
 }
 
-fn load_config(conn: &Connection, id: i64) -> Result<ProviderConfig, String> {
+pub(crate) fn load_config(conn: &Connection, id: i64) -> Result<ProviderConfig, String> {
     let row = row_from(conn, id).map_err(|e| e.to_string())?;
     let row = row.ok_or("provider 不存在")?;
     let key_ref: String = conn
@@ -100,12 +107,18 @@ fn save_provider(conn: &Connection, input: &ProviderInput) -> Result<i64, String
     if input.base_url.is_empty() {
         return Err("base_url 不能为空".into());
     }
+    let limit = input.context_limit.unwrap_or(32768);
+    let reserve = input.output_reserve.unwrap_or(4096);
+    if limit == 0 || reserve == 0 || reserve >= limit {
+        return Err("上下文预算必须为正数，且输出预留小于上下文预算".into());
+    }
+    let settings = json!({"context_limit":limit,"output_reserve":reserve}).to_string();
     let key_ref = format!("provider-key-{}", input.name);
     crate::creds::save(&key_ref, &input.api_key).map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT OR REPLACE INTO llm_providers (id, name, protocol, base_url, model_extract, model_write, model_merge, key_ref)
+        "INSERT OR REPLACE INTO llm_providers (id, name, protocol, base_url, model_extract, model_write, model_merge, key_ref, params_json)
          VALUES (
-           (SELECT id FROM llm_providers WHERE name = ?1), ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+           (SELECT id FROM llm_providers WHERE name = ?1), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             input.name,
             input.protocol,
@@ -113,7 +126,8 @@ fn save_provider(conn: &Connection, input: &ProviderInput) -> Result<i64, String
             input.model_extract,
             input.model_write,
             input.model_merge,
-            key_ref
+            key_ref,
+            settings
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -127,7 +141,7 @@ fn save_provider(conn: &Connection, input: &ProviderInput) -> Result<i64, String
 
 fn list_providers(conn: &Connection) -> Result<Vec<ProviderRow>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, name, protocol, base_url, model_extract, model_write, model_merge FROM llm_providers ORDER BY id")
+        .prepare("SELECT id, name, protocol, base_url, model_extract, model_write, model_merge, json_extract(params_json,'$.context_limit'), json_extract(params_json,'$.output_reserve') FROM llm_providers ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -139,6 +153,8 @@ fn list_providers(conn: &Connection) -> Result<Vec<ProviderRow>, String> {
                 model_extract: r.get(4)?,
                 model_write: r.get(5)?,
                 model_merge: r.get(6)?,
+                context_limit: r.get(7)?,
+                output_reserve: r.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -237,6 +253,8 @@ mod tests {
             model_write: Some("m-write".into()),
             model_merge: Some("m-merge".into()),
             api_key: "sk-test".into(),
+            context_limit: Some(32768),
+            output_reserve: Some(4096),
         }
     }
 
@@ -259,5 +277,22 @@ mod tests {
         let mut bad = sample("bad");
         bad.protocol = "grpc".into();
         assert!(save_provider(&conn, &bad).is_err());
+    }
+
+    #[test]
+    fn invalid_budget_does_not_replace_live_provider() {
+        let conn = db();
+        let input = sample("budget-validation");
+        let id = save_provider(&conn, &input).unwrap();
+        let mut invalid = input;
+        invalid.context_limit = Some(8192);
+        invalid.output_reserve = Some(8192);
+        invalid.base_url = "https://should-not-replace.invalid".into();
+        assert!(save_provider(&conn, &invalid).is_err());
+        let stored = row_from(&conn, id).unwrap().unwrap();
+        assert_eq!(stored.base_url, "https://api.example.com/v1");
+        assert_eq!(stored.context_limit, Some(32768));
+        invalid.output_reserve = Some(0);
+        assert!(save_provider(&conn, &invalid).is_err());
     }
 }

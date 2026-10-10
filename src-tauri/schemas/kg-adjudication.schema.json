@@ -1,0 +1,6 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema", "title":"kg_adjudication", "type":"object", "additionalProperties":false,
+  "required":["schema_version","clusters"],
+  "properties":{"schema_version":{"const":"kg-adjudication/v1"},"clusters":{"type":"array","items":{"$ref":"#/$defs/cluster"}}},
+  "$defs":{"cluster":{"type":"object","additionalProperties":false,"required":["cluster_key","decision","keep_keys","unresolved","reason","evidence_refs"],"properties":{"cluster_key":{"type":"string","minLength":1},"decision":{"enum":["keep","drop","unresolved"]},"keep_keys":{"type":"array","items":{"type":"string","minLength":1}},"unresolved":{"type":"boolean"},"reason":{"type":"string"},"evidence_refs":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}}}}
+}

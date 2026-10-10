@@ -2,7 +2,7 @@
 // /chat/completions: 结构化(json_schema strict) + SSE 流式；Bearer 认证；
 // 429/5xx 指数退避 1 次；schema 校验失败 → prompt 内嵌 schema 降级重试 1 次。
 
-use crate::llm::{LlmClient, LlmError, ProviderConfig, StructuredRequest, TextRequest};
+use crate::llm::{combined_usage, reported_usage, LlmClient, LlmError, ProviderConfig, StructuredRequest, StructuredResponse, TextRequest};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -57,6 +57,10 @@ impl OpenAiClient {
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn structured(&self, req: StructuredRequest<'_>) -> Result<Value, LlmError> {
+        Ok(self.structured_with_usage(req).await?.value)
+    }
+
+    async fn structured_with_usage(&self, req: StructuredRequest<'_>) -> Result<StructuredResponse, LlmError> {
         let model = self.cfg.model_for(req.task)?.to_string();
         let messages: Vec<Value> = req
             .messages
@@ -79,6 +83,7 @@ impl LlmClient for OpenAiClient {
             },
         });
         let resp = self.post_with_retry(body).await?;
+        let usage = reported_usage(&resp, "prompt_tokens", "completion_tokens");
         let content = resp
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -112,9 +117,9 @@ impl LlmClient for OpenAiClient {
             validator
                 .validate(&parsed2)
                 .map_err(|e| LlmError::Schema(e.to_string()))?;
-            return Ok(parsed2);
+            return Ok(StructuredResponse { value:parsed2, usage:combined_usage(usage, reported_usage(&resp2,"prompt_tokens","completion_tokens")) });
         }
-        Ok(parsed)
+        Ok(StructuredResponse { value:parsed, usage })
     }
 
     async fn stream_text(
@@ -151,6 +156,7 @@ impl LlmClient for OpenAiClient {
         let mut stream = resp.bytes_stream();
         let mut buf = String::new();
         let mut full = String::new();
+        let mut finished = false;
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| LlmError::Stream(e.to_string()))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -163,6 +169,10 @@ impl LlmClient for OpenAiClient {
                         return Ok(full);
                     }
                     if let Ok(ev) = serde_json::from_str::<Value>(data) {
+                        if let Some(reason) = ev.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+                            if reason != "stop" { return Err(LlmError::Stream(format!("generation ended with {reason}"))); }
+                            finished = true;
+                        }
                         if let Some(d) = ev
                             .pointer("/choices/0/delta/content")
                             .and_then(Value::as_str)
@@ -174,7 +184,7 @@ impl LlmClient for OpenAiClient {
                 }
             }
         }
-        Ok(full)
+        if finished { Ok(full) } else { Err(LlmError::Stream("generation ended before a completion marker".into())) }
     }
 }
 
@@ -238,6 +248,22 @@ mod tests {
         };
         let v = client.structured(req).await.unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn structured_preserves_reported_token_usage() {
+        let server = MockServer::start().await;
+        let mut body = ok_body();
+        body["usage"] = json!({"prompt_tokens": 143, "completion_tokens": 29});
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body)).mount(&server).await;
+        let client = OpenAiClient { cfg: cfg(server.uri()), http: reqwest::Client::new() };
+        let shape = schema();
+        let response = client.structured_with_usage(StructuredRequest {
+            task: TaskKind::Extract, messages: vec![], schema:&shape, schema_name:"test", temperature:0.0,
+        }).await.unwrap();
+        assert_eq!(response.usage, Some((143,29)));
+        assert_eq!(response.value["ok"], true);
     }
 
     #[tokio::test]
@@ -372,5 +398,16 @@ mod tests {
             .unwrap();
         assert_eq!(full, "你好，世界");
         assert_eq!(*got.lock(), "你好，世界");
+    }
+
+    #[tokio::test]
+    async fn truncated_sse_is_not_a_successful_chapter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"))
+            .mount(&server).await;
+        let client = OpenAiClient {cfg:cfg(server.uri()),http:reqwest::Client::new()};
+        let result = client.stream_text(TextRequest {task:TaskKind::Write,messages:vec![],temperature:0.8,max_tokens:None},std::sync::Arc::new(|_|{})).await;
+        assert!(matches!(result,Err(LlmError::Stream(_))));
     }
 }

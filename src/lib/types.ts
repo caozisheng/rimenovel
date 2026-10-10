@@ -17,8 +17,8 @@ export interface ChapterContent {
   title: string;
   content: string;
   source: string;
+  graph_error?: string | null;
 }
-
 export interface ProviderRow {
   id: number;
   name: string;
@@ -27,10 +27,13 @@ export interface ProviderRow {
   model_extract: string | null;
   model_write: string | null;
   model_merge: string | null;
+  context_limit: number | null;
+  output_reserve: number | null;
 }
-
 export interface ExtractionStatus {
   book_id: number;
+  job_id?: number | null;
   state: string;
   progress: number;
+  error?: string | null;
 }

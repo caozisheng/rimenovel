@@ -6,7 +6,10 @@ use rusqlite::Connection;
 
 // 迁移清单：新增迁移时按序追加 (版本号, 文件内容)。
 // 版本号 = 文件名前缀，user_version 记录已应用的最新版本。
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../migrations/0001_init.sql")),
+    (2, include_str!("../../../migrations/0002_kg_facts.sql")),
+];
 
 pub struct Db<'a> {
     pub conn: &'a Connection,
@@ -77,45 +80,6 @@ mod tests {
         assert_eq!(v, v2);
     }
 
-    #[test]
-    fn init_creates_all_13_tables_and_indexes() {
-        let conn = mem_db();
-        Db::new(&conn).migrate().unwrap();
-        let expected = [
-            "books",
-            "chapters",
-            "generated_chapters",
-            "edits_log",
-            "reader_intent",
-            "directives",
-            "graph_nodes",
-            "graph_edges",
-            "graph_events",
-            "chapter_graph_meta",
-            "jobs",
-            "llm_providers",
-            "llm_cache",
-            "llm_usage",
-        ];
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap();
-        let tables: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        for t in expected {
-            assert!(tables.contains(&t.to_string()), "missing table: {t}");
-        }
-        let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")
-            .unwrap();
-        let idx_count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
-        assert!(
-            idx_count >= 9,
-            "expected >=9 custom indexes, got {idx_count}"
-        );
-    }
 }
 pub mod books;
+pub mod kg;

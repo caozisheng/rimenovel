@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "chapter_idx", "nodes", "edges", "events", "preconditions", "unresolved"],
+  "properties": {
+    "schema_version": {"const": "1.0"}, "chapter_idx": {"type": "integer", "minimum": 2},
+    "nodes": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}},
+    "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "preconditions": {"type": "array", "items": {"$ref": "#/$defs/precondition"}},
+    "unresolved": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "node": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "type", "name", "aliases", "summary", "chapter_idx", "provenance"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1}, "type": {"enum": ["character", "location", "item", "faction", "concept"]},
+        "name": {"type": "string", "minLength": 1}, "aliases": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": ["string", "null"]}, "chapter_idx": {"type": "integer", "minimum": 2},
+        "provenance": {"const": "ai_adapted"}
+      }
+    },
+    "edge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "src", "dst", "rel_type", "description", "status", "since_chapter", "chapter_idx", "provenance"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1}, "src": {"type": "string"}, "dst": {"type": "string"},
+        "rel_type": {"type": "string", "minLength": 1}, "description": {"type": ["string", "null"]},
+        "status": {"enum": ["active", "broken", "former", "unknown"]},
+        "since_chapter": {"type": "integer", "minimum": 1}, "chapter_idx": {"type": "integer", "minimum": 2},
+        "provenance": {"const": "ai_adapted"}
+      }
+    },
+    "event": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "title", "chapter_idx", "order", "participants", "location", "summary", "outcome", "provenance"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1}, "title": {"type": "string"}, "chapter_idx": {"type": "integer", "minimum": 2},
+        "order": {"type": "integer", "minimum": 0}, "participants": {"type": "array", "items": {"type": "string"}},
+        "location": {"type": ["string", "null"]}, "summary": {"type": "string"}, "outcome": {"type": "string"},
+        "provenance": {"const": "ai_adapted"}
+      }
+    },
+    "precondition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "event_key", "subject_key", "predicate", "value", "assertion_kind", "evidence_refs"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "assertion_kind": {"enum": ["confirmed", "reported", "inferred"]},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "event_key": {"type": "string"}, "subject_key": {"type": "string"},
+        "predicate": {"enum": ["life_status", "owner", "location"]},
+        "value": {
+          "type": "object", "additionalProperties": false, "required": ["kind", "value"],
+          "properties": {"kind": {"enum": ["scalar", "entity_ref", "none", "unknown"]}, "value": {"type": ["string", "null"]}}
+        }
+      }
+    }
+  }
+}

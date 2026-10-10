@@ -11,6 +11,8 @@ const emptyForm = {
   model_write: "",
   model_merge: "",
   api_key: "",
+  context_limit: 32768,
+  output_reserve: 4096,
 };
 
 export const providerPanel = reactive({
@@ -33,6 +35,12 @@ async function refreshProviders(): Promise<void> {
 }
 
 export async function saveProvider(): Promise<void> {
+  const contextLimit = providerPanel.form.context_limit ?? 32768;
+  const outputReserve = providerPanel.form.output_reserve ?? 4096;
+  if (contextLimit <= 0 || outputReserve <= 0 || outputReserve >= contextLimit) {
+    providerPanel.error = "输出预留必须大于 0 且小于上下文上限";
+    return;
+  }
   providerPanel.saving = true;
   providerPanel.error = "";
   try {

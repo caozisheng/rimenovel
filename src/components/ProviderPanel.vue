@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NModal, NSelect, type FormInst } from "naive-ui";
+import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, type FormInst } from "naive-ui";
 import { closePanel, deleteProvider, providerPanel, saveProvider, testProvider } from "../lib/providerPanel";
 
 const form = ref<FormInst | null>(null);
@@ -55,6 +55,10 @@ async function submit(): Promise<void> {
         <NFormItem label="合并模型"><NInput v-model:value="providerPanel.form.model_merge" placeholder="中价档" /></NFormItem>
         <NFormItem label="写作模型"><NInput v-model:value="providerPanel.form.model_write" placeholder="高质档" /></NFormItem>
       </div>
+      <div class="row">
+        <NFormItem label="上下文上限"><NInputNumber v-model:value="providerPanel.form.context_limit" :min="1" placeholder="32768" /></NFormItem>
+        <NFormItem label="输出预留"><NInputNumber v-model:value="providerPanel.form.output_reserve" :min="1" placeholder="4096" /></NFormItem>
+      </div>
       <NButton attr-type="submit" type="primary" :loading="providerPanel.saving" :disabled="providerPanel.saving">保存</NButton>
     </NForm>
     <ul v-if="providerPanel.rows.length" class="list">
@@ -63,6 +67,7 @@ async function submit(): Promise<void> {
           <strong>{{ p.name }}</strong>
           <span class="meta">{{ p.protocol }} · {{ p.base_url }}</span>
           <span class="meta">抽取 {{ p.model_extract ?? '—' }} / 合并 {{ p.model_merge ?? '—' }} / 写作 {{ p.model_write ?? '—' }}</span>
+          <span class="meta">预算 {{ p.context_limit ?? 32768 }} tokens · 预留 {{ p.output_reserve ?? 4096 }}</span>
         </div>
         <div class="item-ops">
           <NButton size="small" :disabled="providerPanel.testing" @click="testProvider(p.id)">测连</NButton>

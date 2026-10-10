@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, toRefs, useId, watch } from "vue";
 import CyGraph from "./CyGraph.vue";
 import TimelineView from "./TimelineView.vue";
 import { entityTypes, eventNodeKeys, filterGraph, provenanceLabels, provenanceTokens, purposeLabels, type EntityType, type GraphEdge, type GraphElement, type GraphEvent, type GraphNode, type GraphPurpose } from "../lib/graph";
@@ -12,7 +12,9 @@ const props = withDefaults(defineProps<{
   title?: string;
   canJump?: boolean;
   purpose: GraphPurpose;
-}>(), { title: "图谱与时间线", canJump: false });
+  showProperties?: boolean;
+}>(), { title: "图谱与时间线", canJump: false, showProperties: true });
+const { nodes, events, title, canJump, purpose, showProperties } = toRefs(props);
 const emit = defineEmits<{ jump: [chapterIdx: number] }>();
 const selection = useGraphSelectionStore();
 const activeTypes = ref<EntityType[]>(entityTypes.map((type) => type.value));
@@ -67,7 +69,7 @@ onBeforeUnmount(() => selection.clear());
 </script>
 
 <template>
-  <section class="visualization" :aria-label="title">
+  <section class="visualization" :class="{ 'without-properties': !showProperties }" :aria-label="title">
     <header class="visualization-header">
       <h2>{{ title }}</h2>
       <span class="read-only">只读</span>
@@ -98,7 +100,7 @@ onBeforeUnmount(() => selection.clear());
       <main class="graph-pane" aria-label="实体关系画布">
         <CyGraph :nodes="filtered.nodes" :edges="filtered.edges" />
       </main>
-      <aside class="properties" :class="{ active: !!selected }" aria-label="所选元素属性">
+      <aside v-if="showProperties" class="properties" :class="{ active: !!selected }" aria-label="所选元素属性">
         <template v-if="selected">
           <div class="properties-header"><h3>{{ selectedTitle }}</h3><button ref="propertyClose" type="button" aria-label="关闭所选元素属性" @click="selection.clear()">关闭</button></div>
           <dl>
@@ -143,6 +145,7 @@ button { font: inherit; font-size: 14px; padding: 7px 10px; border: 1px solid va
 button[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-accent); }
 button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
 .panes { position: relative; display: grid; grid-template-columns: 260px minmax(0, 1fr) 310px; flex: 1; min-height: 0; }
+.without-properties .panes { grid-template-columns: 260px minmax(0, 1fr); }
 .tools-pane, .properties { padding: 16px; overflow-y: auto; min-height: 0; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
 .tools-pane { border-right: 1px solid var(--color-border); }
 .properties { border-left: 1px solid var(--color-border); background: var(--color-surface-raised); }

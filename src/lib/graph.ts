@@ -28,3 +28,22 @@ export function filterGraph(graph: Pick<GraphData, "nodes" | "edges">, types: En
   const keys = new Set(nodes.map((node) => node.key));
   return { nodes, edges: graph.edges.filter((edge) => keys.has(edge.src) && keys.has(edge.dst)) };
 }
+export interface FogCounts { entities: number; relations: number; events: number }
+export interface GraphView extends GraphData {
+  purpose: GraphPurpose;
+  reader_progress: number;
+  chapter_idx: number | null;
+  fog: FogCounts | null;
+  revealed: boolean;
+  ready: boolean;
+  unresolved: string[];
+  revision: number | null;
+  drift_score: number | null;
+  reading_line_version: number;
+  divergence_idx: number | null;
+}
+export interface GraphQuery { book_id: number; scope: "global" | "chapter"; purpose: GraphPurpose; chapter_idx?: number | null }
+export interface EditInput { book_id: number; scope: "global" | "chapter"; chapter_idx?: number | null; kind: "node" | "edge" | "event" | "directive" | "drift_pref"; action: "upsert" | "delete"; key?: string | null; data: Record<string, unknown> }
+export interface EditRecord { id: number; target_type: string; target_id: string; action: string; after_json: string | null; effective_from: number; active: boolean }
+export interface EvidenceView { key: string; chapter_idx: number; start_byte: number; end_byte: number; text: string; source: string }
+export interface GraphJobStatus { book_id: number; job_id?: number | null; progress: number; state: string; error?: string | null }
