@@ -1,85 +1,94 @@
 <script setup lang="ts">
-// Provider 管理面板（dev-plan Task 3.5 UI）
-import {
-  closePanel,
-  deleteProvider,
-  providerPanel,
-  saveProvider,
-  testProvider,
-} from "../lib/providerPanel";
+import { ref } from "vue";
+import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NModal, NSelect, type FormInst } from "naive-ui";
+import { closePanel, deleteProvider, providerPanel, saveProvider, testProvider } from "../lib/providerPanel";
+
+const form = ref<FormInst | null>(null);
+const protocolOptions = [
+  { label: "OpenAI 兼容", value: "openai" },
+  { label: "Anthropic", value: "anthropic" },
+];
+const rules = {
+  name: { required: true, message: "请输入名称", trigger: ["input", "blur"] },
+  base_url: { required: true, message: "请输入 Base URL", trigger: ["input", "blur"] },
+  api_key: { required: true, message: "请输入 API Key", trigger: ["input", "blur"] },
+};
+async function submit(): Promise<void> {
+  try {
+    await form.value?.validate();
+  } catch {
+    return;
+  }
+  await saveProvider();
+}
 </script>
 
 <template>
-  <div v-if="providerPanel.visible" class="panel-mask" @click.self="closePanel">
-    <section class="panel">
-      <header class="panel-head">
-        <h2>LLM Provider</h2>
-        <button @click="closePanel">✕</button>
-      </header>
-
-      <form class="form" @submit.prevent="saveProvider">
-        <div class="row">
-          <label>名称 <input v-model="providerPanel.form.name" required placeholder="my-openrouter" /></label>
-          <label>
-            协议
-            <select v-model="providerPanel.form.protocol">
-              <option value="openai">OpenAI 兼容</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
-          </label>
+  <NModal
+    :show="providerPanel.visible"
+    preset="card"
+    title="LLM Provider"
+    class="provider-modal"
+    :bordered="false"
+    :style="{ width: 'min(600px, calc(100vw - 32px))', maxHeight: 'calc(100dvh - 32px)', overflow: 'auto' }"
+    @update:show="(show: boolean) => { if (!show) closePanel(); }"
+    @close="closePanel"
+  >
+    <NAlert v-if="providerPanel.error" type="error" class="notice">{{ providerPanel.error }}</NAlert>
+    <NForm ref="form" :model="providerPanel.form" :rules="rules" @submit.prevent="submit">
+      <div class="row">
+        <NFormItem label="名称" path="name">
+          <NInput v-model:value="providerPanel.form.name" placeholder="my-openrouter" />
+        </NFormItem>
+        <NFormItem label="协议" path="protocol">
+          <NSelect v-model:value="providerPanel.form.protocol" :options="protocolOptions" aria-label="协议" />
+        </NFormItem>
+      </div>
+      <NFormItem label="Base URL" path="base_url">
+        <NInput v-model:value="providerPanel.form.base_url" placeholder="https://api.example.com/v1" />
+      </NFormItem>
+      <NFormItem label="API Key" path="api_key">
+        <NInput v-model:value="providerPanel.form.api_key" type="password" show-password-on="click" placeholder="sk-..." :input-props="{ autocomplete: 'off' }" />
+      </NFormItem>
+      <div class="row three">
+        <NFormItem label="抽取模型"><NInput v-model:value="providerPanel.form.model_extract" placeholder="低价档" /></NFormItem>
+        <NFormItem label="合并模型"><NInput v-model:value="providerPanel.form.model_merge" placeholder="中价档" /></NFormItem>
+        <NFormItem label="写作模型"><NInput v-model:value="providerPanel.form.model_write" placeholder="高质档" /></NFormItem>
+      </div>
+      <NButton attr-type="submit" type="primary" :loading="providerPanel.saving" :disabled="providerPanel.saving">保存</NButton>
+    </NForm>
+    <ul v-if="providerPanel.rows.length" class="list">
+      <li v-for="p in providerPanel.rows" :key="p.id" class="item">
+        <div class="item-main">
+          <strong>{{ p.name }}</strong>
+          <span class="meta">{{ p.protocol }} · {{ p.base_url }}</span>
+          <span class="meta">抽取 {{ p.model_extract ?? '—' }} / 合并 {{ p.model_merge ?? '—' }} / 写作 {{ p.model_write ?? '—' }}</span>
         </div>
-        <label>Base URL <input v-model="providerPanel.form.base_url" required placeholder="https://api.example.com/v1" /></label>
-        <label>API Key <input v-model="providerPanel.form.api_key" type="password" required placeholder="sk-..." /></label>
-        <div class="row three">
-          <label>抽取模型 <input v-model="providerPanel.form.model_extract" placeholder="低价档" /></label>
-          <label>合并模型 <input v-model="providerPanel.form.model_merge" placeholder="中价档" /></label>
-          <label>写作模型 <input v-model="providerPanel.form.model_write" placeholder="高质档" /></label>
+        <div class="item-ops">
+          <NButton size="small" :disabled="providerPanel.testing" @click="testProvider(p.id)">测连</NButton>
+          <NButton size="small" type="error" secondary @click="deleteProvider(p.id)">删除</NButton>
         </div>
-        <button type="submit" :disabled="providerPanel.saving">
-          {{ providerPanel.saving ? "保存中…" : "保存" }}
-        </button>
-      </form>
-
-      <ul v-if="providerPanel.rows.length" class="list">
-        <li v-for="p in providerPanel.rows" :key="p.id" class="item">
-          <div class="item-main">
-            <strong>{{ p.name }}</strong>
-            <span class="meta">{{ p.protocol }} · {{ p.base_url }}</span>
-            <span class="meta">抽取 {{ p.model_extract ?? "—" }} / 写作 {{ p.model_write ?? "—" }}</span>
-          </div>
-          <div class="item-ops">
-            <button :disabled="providerPanel.testing" @click="testProvider(p.id)">测连</button>
-            <button class="danger" @click="deleteProvider(p.id)">删除</button>
-          </div>
-        </li>
-      </ul>
-      <p v-else class="empty">还没有 provider，先添加一个。</p>
-
-      <p v-if="providerPanel.testResult" class="test-result" :class="{ ok: providerPanel.testResult === '连接成功' }">
-        {{ providerPanel.testResult }}
-      </p>
-      <p class="hint">未填写的模型档位将在调用时报「未配置」错误。</p>
-    </section>
-  </div>
+      </li>
+    </ul>
+    <NEmpty v-else description="还没有 Provider，先添加一个" class="empty" />
+    <NAlert v-if="providerPanel.testResult" :type="providerPanel.testResult === '连接成功' ? 'success' : 'error'" class="notice">{{ providerPanel.testResult }}</NAlert>
+    <p class="hint">未填写的模型档位将在调用时报「未配置」错误。</p>
+  </NModal>
 </template>
 
 <style scoped>
-.panel-mask { position: fixed; inset: 0; background: #0008; display: flex; align-items: center; justify-content: center; z-index: 50; }
-.panel { background: var(--vv-bg, #fff); border-radius: 12px; width: min(560px, 92vw); max-height: 86vh; overflow: auto; padding: 20px 24px; }
-.panel-head { display: flex; justify-content: space-between; align-items: center; }
-.form { display: grid; gap: 10px; margin: 12px 0 20px; }
-.form label { display: grid; gap: 4px; font-size: 0.9em; color: #666; }
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.row.three { grid-template-columns: 1fr 1fr 1fr; }
-input, select { padding: 6px 8px; border: 1px solid #8886; border-radius: 6px; font-size: 0.95em; }
-.list { list-style: none; padding: 0; display: grid; gap: 8px; }
-.item { border: 1px solid #8884; border-radius: 8px; padding: 10px 12px; display: flex; justify-content: space-between; gap: 8px; }
-.item-main { display: grid; gap: 2px; }
-.meta { color: #888; font-size: 0.82em; }
-.item-ops { display: flex; gap: 6px; align-items: center; }
-.danger { color: crimson; }
-.empty { color: #888; }
-.test-result { font-weight: 600; }
-.test-result.ok { color: seagreen; }
-.hint { color: #aaa; font-size: 0.8em; }
+.row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-sm); }
+.row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.list { list-style: none; padding: 0; display: grid; gap: var(--space-sm); margin-top: var(--space-lg); }
+.item { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 12px; display: flex; justify-content: space-between; gap: var(--space-sm); }
+.item-main { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.meta { color: var(--color-text-secondary); font-size: 0.82em; }
+.item-ops { display: flex; gap: var(--space-xs); align-items: center; flex-shrink: 0; }
+.empty { margin: var(--space-lg) 0; }
+.notice { margin-bottom: var(--space-md); }
+.hint { color: var(--color-text-secondary); font-size: 0.8em; }
+@media (max-width: 480px) {
+  .row, .row.three { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .item { flex-direction: column; }
+}
 </style>

@@ -20,6 +20,7 @@ export const providerPanel = reactive({
   testing: false,
   testResult: "",
   saving: false,
+  error: "",
 });
 
 export function resetForm(): void {
@@ -33,6 +34,7 @@ async function refreshProviders(): Promise<void> {
 
 export async function saveProvider(): Promise<void> {
   providerPanel.saving = true;
+  providerPanel.error = "";
   try {
     await tauriInvoke("provider_save", {
       input: {
@@ -44,6 +46,8 @@ export async function saveProvider(): Promise<void> {
     });
     resetForm();
     await refreshProviders();
+  } catch (e) {
+    providerPanel.error = String(e);
   } finally {
     providerPanel.saving = false;
   }
@@ -62,13 +66,24 @@ export async function testProvider(id: number): Promise<void> {
 }
 
 export async function deleteProvider(id: number): Promise<void> {
-  await tauriInvoke("provider_delete", { id });
-  await refreshProviders();
+  providerPanel.error = "";
+  try {
+    await tauriInvoke("provider_delete", { id });
+    await refreshProviders();
+  } catch (e) {
+    providerPanel.error = String(e);
+  }
 }
 
 export async function openPanel(): Promise<void> {
   providerPanel.visible = true;
-  await refreshProviders();
+  providerPanel.error = "";
+  providerPanel.testResult = "";
+  try {
+    await refreshProviders();
+  } catch (e) {
+    providerPanel.error = String(e);
+  }
 }
 
 export function closePanel(): void {

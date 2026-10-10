@@ -1,0 +1,150 @@
+/* ============================================================
+   RimeNovel 设计令牌（参考 Legado-Tauri 令牌体系裁剪）
+   双层结构: 亮色基集 + data-theme="dark" 暗色集; 三态: dark|light|auto
+   ============================================================ */
+:root {
+  /* 间距 */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+
+  /* 圆角 */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+
+  /* 字号阶梯 */
+  --font-size-sm: 14px;
+  --font-size-md: 16px;
+  --font-size-lg: 18px;
+  --font-size-xl: 24px;
+  --font-size-2xl: 32px;
+
+  /* 过渡 */
+  --transition-fast: 120ms ease;
+  --transition-base: 220ms ease;
+
+  /* 滚动条 */
+  --scrollbar-size: 6px;
+  --scrollbar-thumb: rgba(82, 82, 91, 0.28);
+  --scrollbar-thumb-hover: rgba(82, 82, 91, 0.46);
+
+  /* 语义色（亮色基集） */
+  --color-danger: #ef4444;
+  --color-danger-subtle: rgba(239, 68, 68, 0.1);
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+
+  --color-surface: #f4f4f5;
+  --color-surface-raised: #ffffff;
+  --color-surface-hover: #e4e4e7;
+  --color-border: #e4e4e7;
+
+  --color-text-primary: #18181b;
+  --color-text-secondary: #52525b;
+  --color-text-muted: #a1a1aa;
+
+  --color-accent: #6366f1;
+  --color-accent-subtle: #eef2ff;
+
+  /* 阅读排版（ReaderView 消费） */
+  --reader-measure: 42rem;
+  --reader-inline-padding: 1.5rem;
+  --reader-font-serif: "LXGW WenKai", "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+  --reader-line-height: 1.9;
+  --reader-letter-spacing: 0.02em;
+
+  /* 阅读主题: 纸白(默认) / 米黄 / 夜间 —— 由 ReaderView 切 data-reader-theme */
+  --reader-theme-paper-bg: #ffffff;
+  --reader-theme-paper-text: #27272a;
+  --reader-theme-sepia-bg: #f5efdc;
+  --reader-theme-sepia-text: #5b4a32;
+  --reader-theme-night-bg: #18181b;
+  --reader-theme-night-text: #d4d4d8;
+}
+
+/* 强制暗色 */
+:root[data-theme="dark"] {
+  --color-danger: #f87171;
+  --color-danger-subtle: rgba(248, 113, 113, 0.12);
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+
+  --color-surface: #18181b;
+  --color-surface-raised: #27272a;
+  --color-surface-hover: #3f3f46;
+  --color-border: #3f3f46;
+
+  --color-text-primary: #fafafa;
+  --color-text-secondary: #a1a1aa;
+  --color-text-muted: #71717a;
+
+  --color-accent: #818cf8;
+  --color-accent-subtle: #1e1b4b;
+
+}
+
+/* 系统偏好暗色（auto 态） */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-danger: #f87171;
+    --color-danger-subtle: rgba(248, 113, 113, 0.12);
+    --color-success: #4ade80;
+    --color-warning: #fbbf24;
+
+    --color-surface: #18181b;
+    --color-surface-raised: #27272a;
+    --color-surface-hover: #3f3f46;
+    --color-border: #3f3f46;
+
+    --color-text-primary: #fafafa;
+    --color-text-secondary: #a1a1aa;
+    --color-text-muted: #71717a;
+
+    --color-accent: #818cf8;
+    --color-accent-subtle: #1e1b4b;
+
+  }
+}
+
+/* ── 基础元素 ─────────────────────────────────────────────── */
+html {
+  color-scheme: light;
+}
+html[data-theme="dark"] { color-scheme: dark; }
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme]) { color-scheme: dark; }
+}
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-md);
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
+  transition:
+    background var(--transition-base),
+    color var(--transition-base);
+}
+
+
+::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
