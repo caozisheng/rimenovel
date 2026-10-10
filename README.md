@@ -1,5 +1,8 @@
 # RimeNovel
 
+![Uploading rimenovel-icon.png…]()
+
+
 A novel reader where readers can influence the story direction: import a novel → extract a dual-layer knowledge graph (global/chapter) → visualize and edit → AI generates subsequent chapters based on the edited graph.
 
 ## Development
