@@ -41,6 +41,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::import_book,
+            commands::delete_book_cmd,
             commands::list_books_cmd,
             commands::get_chapter_titles,
             commands::get_chapter_cmd,

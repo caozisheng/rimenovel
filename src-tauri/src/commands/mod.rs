@@ -2,7 +2,7 @@
 // 业务在 core/store，此处只做参数分派与状态桥接。
 
 use crate::core::split::{split_txt, RawChapter, SplitOptions};
-use crate::store::books::{create_book_with_chapters, get_chapter, list_books, NewChapter};
+use crate::store::books::{create_book_with_chapters, delete_book, get_chapter, list_books, NewChapter};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::Path;
@@ -69,6 +69,13 @@ pub fn import_book(state: tauri::State<AppState>, path: String) -> Result<i64, S
     let conn = guard.as_mut().ok_or("数据库未初始化")?;
     create_book_with_chapters(conn, &title, None, format, &path, &chapters)
         .map_err(|e| format!("入库失败: {e}"))
+}
+
+#[tauri::command]
+pub fn delete_book_cmd(state: tauri::State<AppState>, book_id: i64) -> Result<(), String> {
+    let guard = state.db.lock();
+    let conn = guard.as_ref().ok_or("数据库未初始化")?;
+    delete_book(conn, book_id).map_err(|e| format!("删除失败: {e}"))
 }
 
 /// txt 编码探测：优先 UTF-8，回退 GBK（中文书常见）。

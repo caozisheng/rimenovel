@@ -29,11 +29,12 @@ impl Default for SplitOptions {
 /// 章节标题正则（按优先级顺序尝试，取首个匹配数达标的规则）
 /// 1. 第X章/节/卷/回/集/部（中文数字或阿拉伯数字，可含空格/标点尾巴）
 /// 2. Chapter N / CHAPTER N
-/// 3. 数字章（"1. 标题" / "一、标题"）
+/// 3. 数字章（"1. 标题" / "一、标题" / "一　标题"）
 const PATTERNS: &[&str] = &[
     r"^\s*第\s*[0-9〇零一二两三四五六七八九十百千万亿]+\s*[章节卷回集部]\s*[^\n]{0,30}$",
     r"^\s*(?:Chapter|CHAPTER|chapter)\s+\d+.*$",
     r"^\s*[0-9〇零一二两三四五六七八九十]+\s*[、.．]\s*[^\n]{1,30}$",
+    r"^\s*[0-9〇零一二两三四五六七八九十]+[\s　]+[^\n]{1,30}$",
 ];
 
 /// 对全文按章节标题行切分。无任何规则达标 → 整书单章。
@@ -155,6 +156,15 @@ mod tests {
             },
         );
         assert_eq!(cs2.len(), 2);
+    }
+
+    #[test]
+    fn splits_chinese_numeral_headings_with_ideographic_space() {
+        let txt = "一　灭门\n正文A\n二　聆秘\n正文B\n三　救难\n正文C\n";
+        let cs = split_txt(txt, &SplitOptions::default());
+        assert_eq!(cs.len(), 3);
+        assert_eq!(cs[0].title, "一　灭门");
+        assert_eq!(cs[2].title, "三　救难");
     }
 
     #[test]

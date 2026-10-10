@@ -78,6 +78,32 @@ pub fn list_books(conn: &Connection) -> rusqlite::Result<Vec<Book>> {
     rows.collect()
 }
 
+/// 删除书籍及其全部关联数据。
+pub fn delete_book(conn: &Connection, book_id: i64) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> rusqlite::Result<()> {
+        // These tables intentionally have nullable book_id and no FK cascade.
+        conn.execute("DELETE FROM jobs WHERE book_id = ?1", params![book_id])?;
+        conn.execute(
+            "DELETE FROM llm_usage WHERE book_id = ?1",
+            params![book_id],
+        )?;
+        // All other book-owned tables reference books(id) with ON DELETE CASCADE.
+        conn.execute("DELETE FROM books WHERE id = ?1", params![book_id])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 pub fn get_chapter(
     conn: &Connection,
     book_id: i64,
@@ -158,6 +184,51 @@ mod tests {
         assert!(err.is_err());
         // 回滚干净：书架为空
         assert!(list_books(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_book_removes_book_chapters_and_orphaned_book_records() {
+        let conn = db_with_book();
+        let id = create_book_with_chapters(
+            &conn,
+            "待删除",
+            None,
+            "txt",
+            "/tmp/delete.txt",
+            &fixture_chapters(),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (book_id, kind, state) VALUES (?1, 'extract', 'queued')",
+            [id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO llm_usage (provider_id, book_id, task) VALUES (1, ?1, 'extract')",
+            [id],
+        )
+        .unwrap();
+
+        delete_book(&conn, id).unwrap();
+
+        assert!(list_books(&conn).unwrap().is_empty());
+        assert_eq!(count_chapters(&conn, id).unwrap(), 0);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM jobs WHERE book_id = ?1", [id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM llm_usage WHERE book_id = ?1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]

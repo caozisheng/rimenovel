@@ -7,6 +7,10 @@ export async function importBook(path: string): Promise<number> {
   return tauriInvoke<number>("import_book", { path });
 }
 
+export async function deleteBook(bookId: number): Promise<void> {
+  await tauriInvoke<void>("delete_book_cmd", { bookId });
+}
+
 export async function listBooks(): Promise<Book[]> {
   return tauriInvoke<Book[]>("list_books_cmd");
 }
