@@ -98,11 +98,14 @@ fn commit(conn:&Connection,text:&TextVersion,bundle:&ChapterBundle,dependency_di
     tx.execute("UPDATE kg_revisions SET prior_digest=?2 WHERE id=?1",params![revision,prior_digest(&tx,text)?]).map_err(err)?;
     if let Some(config)=config {tx.execute("UPDATE kg_revisions SET config_digest=?2 WHERE id=?1",params![revision,extraction_config_digest(config)?]).map_err(err)?;}
     if let Some(job)=job_id {
-        let (owner,payload)=tx.query_row("SELECT book_id,payload_json FROM jobs WHERE id=?1",[job],|r|Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,Option<String>>(1)?))).map_err(err)?;if owner!=Some(text.book_id){return Err("foreign job checkpoint".into());}
+        let (owner,state,payload)=tx.query_row("SELECT book_id,state,payload_json FROM jobs WHERE id=?1",[job],|r|Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).map_err(err)?;
+        if owner!=Some(text.book_id){return Err("foreign job checkpoint".into());}
+        if !["queued","running","paused"].contains(&state.as_str()){return Err("terminal job cannot commit extraction".into());}
         let mut payload:Value=payload.as_deref().map(parse).transpose()?.unwrap_or_else(||serde_json::json!({}));if !payload.is_object(){return Err("invalid job checkpoint payload".into());}
         let revisions=payload.as_object_mut().unwrap().entry("committed_revisions").or_insert_with(||serde_json::json!({}));revisions.as_object_mut().ok_or("invalid checkpoint revisions")?.insert(text.chapter_idx.to_string(),serde_json::json!({"text_version_id":text.id,"revision":revision,"dependency_digest":dependency_digest}));
         let total:i64=tx.query_row("SELECT COUNT(*) FROM chapters WHERE book_id=?1",[text.book_id],|r|r.get(0)).map_err(err)?;let missing=missing_original_chapters(&tx,text.book_id)?.len();
-        tx.execute("UPDATE jobs SET payload_json=?2,progress=?3,updated_at=datetime('now') WHERE id=?1",params![job,json(&payload)?,if total>0 {(total as usize-missing) as f64/total as f64}else{0.0}]).map_err(err)?;
+        let updated=tx.execute("UPDATE jobs SET payload_json=?2,progress=?3,updated_at=datetime('now') WHERE id=?1 AND state IN ('queued','running','paused')",params![job,json(&payload)?,if total>0 {(total as usize-missing) as f64/total as f64}else{0.0}]).map_err(err)?;
+        if updated!=1{return Err("terminal job cannot update checkpoint".into());}
     }
     tx.commit().map_err(err)?;Ok(revision)
 }

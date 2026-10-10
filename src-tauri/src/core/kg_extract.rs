@@ -418,8 +418,10 @@ async fn structured_cached(
     schema_name: &'static str,
     messages: Vec<ChatMessage>,
 ) -> Result<Value, String> {
+    client.check_cancelled().map_err(|error| error.to_string())?;
     request_fits(config, schema, &messages)?;
-    let request = StructuredRequest { task, messages, schema, schema_name, temperature: 0.0 };
+    let max_tokens = u32::try_from(config.output_reserve).map_err(|_| "输出预算过大")?;
+    let request = StructuredRequest { task, messages, schema, schema_name, temperature: 0.0, max_tokens };
     let key = cache::cache_key(config.provider_id, &config.model_extract, &request)
         .ok_or("deterministic structured request unexpectedly bypassed cache")?;
     {
@@ -431,6 +433,7 @@ async fn structured_cached(
     }
     let response = client.structured_with_usage(request).await.map_err(|err| err.to_string())?;
     {
+        let _commit = client.commit_guard().map_err(|error| error.to_string())?;
         let db = state.db.lock();
         let conn = db.as_ref().ok_or("database is unavailable")?;
         cache::cache_put(conn, &key, &response.value, response.usage).map_err(|err| err.to_string())?;
@@ -751,6 +754,7 @@ pub async fn extract(
     config: &RuntimeConfig,
     job_id: Option<i64>,
 ) -> Result<i64, String> {
+    client.check_cancelled().map_err(|error| error.to_string())?;
     let (expected_line_version, known, old, prior, hard_prior) = {
         let db = state.db.lock();
         let conn = db.as_ref().ok_or("database is unavailable")?;
@@ -804,6 +808,7 @@ pub async fn extract(
     validate_bundle(&text, &bundle, &known, &prior_relations)?;
     let dependencies = extraction_digest(&text, config, &known, &prior, &bundle.spans);
     let revision = {
+        let _commit = client.commit_guard().map_err(|error| error.to_string())?;
         let db = state.db.lock();
         let conn = db.as_ref().ok_or("database is unavailable")?;
         crate::store::kg::commit_bundle_with_config(conn, &text, &bundle, &dependencies, expected_line_version, job_id, config)?
@@ -868,6 +873,7 @@ pub async fn reduce_book(
     let value = structured_cached(state, client, config, book_id, TaskKind::Extract, &REDUCE_SCHEMA, "kg_reduce", messages).await?;
     validate_schema(&REDUCE_SCHEMA, &value)?;
     let reduced: ReductionReply = serde_json::from_value(value).map_err(|err| err.to_string())?;
+    let _commit = client.commit_guard().map_err(|error| error.to_string())?;
     let db = state.db.lock();
     let conn = db.as_ref().ok_or("database is unavailable")?;
     crate::store::kg::save_original_summary(conn, book_id, &reduced.synopsis, &reduced.themes, &reduced.style_guide)

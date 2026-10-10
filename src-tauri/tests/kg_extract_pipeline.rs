@@ -153,6 +153,9 @@ impl rimenovel_lib::llm::LlmClient for RecordedClient {
             other => Err(rimenovel_lib::llm::LlmError::Config(format!("unexpected recorded request {other}"))),
         }
     }
+    async fn structured_with_usage(&self, req: rimenovel_lib::llm::StructuredRequest<'_>) -> Result<rimenovel_lib::llm::StructuredResponse, rimenovel_lib::llm::LlmError> {
+        Ok(rimenovel_lib::llm::StructuredResponse { value: self.structured(req).await?, usage: None })
+    }
 
     async fn stream_text(&self, _req:rimenovel_lib::llm::TextRequest, _delta:std::sync::Arc<dyn for<'a> Fn(&'a str)+Send+Sync>) -> Result<String,rimenovel_lib::llm::LlmError> {
         Err(rimenovel_lib::llm::LlmError::Config("extraction must not request prose".into()))

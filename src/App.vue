@@ -30,6 +30,7 @@ const deletingBookId = ref<number | null>(null);
 const pendingDeleteBook = ref<Book | null>(null);
 const showDeleteDialog = ref(false);
 const extraction = ref<Record<number, ExtractionStatus>>({});
+const jobStateLabels: Record<string, string> = { queued: "等待执行", running: "后台处理中", paused: "已暂停", failed: "任务失败", cancelled: "已取消" };
 const themeMode = ref<ThemeMode>(currentTheme());
 const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const systemDark = ref(colorScheme.matches);
@@ -127,7 +128,7 @@ onMounted(async () => {
   try { books.value = await listBooks(); }
   catch { books.value = []; }
   await refreshExtraction();
-  stopJobProgress = await onKgEvent("job:progress", parseJobStatus, (status) => { extraction.value = { ...extraction.value, [status.book_id]: status }; });
+  stopJobProgress = await onKgEvent("job:progress", parseJobStatus, () => { void refreshExtraction(); });
   pollTimer = setInterval(() => void refreshExtraction(), 3000);
 });
 
@@ -181,8 +182,8 @@ onUnmounted(() => {
               round
             >
               {{ extraction[b.id].state === "done"
-                ? "图谱就绪"
-                : `${extraction[b.id].state} ${Math.round(extraction[b.id].progress * 100)}%` }}
+                ? (extraction[b.id].kind === 'global_extract' ? "整书图谱就绪" : "后台任务完成")
+                : `${jobStateLabels[extraction[b.id].state] ?? extraction[b.id].state} ${Math.round(extraction[b.id].progress * 100)}%` }}
             </NTag>
             <NButton v-if="extraction[b.id]?.state === 'failed'" size="small" type="warning" @click="retryExtraction(b.id)">重试抽取</NButton>
             <span v-if="extraction[b.id]?.state === 'failed' && extraction[b.id]?.error" class="job-error">{{ extraction[b.id]?.error }}</span>

@@ -23,6 +23,11 @@ fn db<T>(state: &AppState, f: impl FnOnce(&Connection) -> Result<T,String>) -> R
     f(guard.as_ref().ok_or("数据库未初始化")?)
 }
 
+fn commit_db<T>(state: &AppState, client: &dyn LlmClient, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+    let _commit = client.commit_guard().map_err(|error| error.to_string())?;
+    db(state, f)
+}
+
 pub fn divergence_from_edits(edits: &[EditRecord]) -> Option<i64> {
     edits.iter().filter(|e| e.active).map(|e| e.effective_from.max(2)).min()
 }
@@ -51,10 +56,11 @@ fn resume_stage(extracted:bool,reconciled:bool)->ResumeStage {
 /// Directory jumps resolve every required selected predecessor, never original fallback after divergence.
 pub async fn ensure_chapter(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfig,
     config:&RuntimeConfig,book_id:i64,idx:i64,on_delta:Arc<dyn Fn(&str)+Send+Sync>) -> Result<TextVersion,String> {
+    client.check_cancelled().map_err(|error| error.to_string())?;
     if idx<1 {return Err("章节序号必须大于零".into());}
     let (line,divergence)=db(state,|c| Ok((repo::line_version(c,book_id)?,divergence_from_edits(&repo::active_edits(c,book_id)?))))?;
     if divergence.is_none_or(|d| idx<d) {
-        let text=db(state,|c| match repo::selected_text(c,book_id,idx)? {
+        let text=commit_db(state,client,|c| match repo::selected_text(c,book_id,idx)? {
             Some(selected)=>Ok(selected),None=>repo::text_version(c,book_id,idx,"original",None)
         })?;
         if !db(state,|c| repo::extraction_matches(c,text.id,config))? {
@@ -65,6 +71,7 @@ pub async fn ensure_chapter(state:&AppState,client:&dyn LlmClient,cfg:&ProviderC
     }
     let mut result=None;
     for chapter in 1..=idx {
+        client.check_cancelled().map_err(|error| error.to_string())?;
         db(state,|c| guard_line_version(line,repo::line_version(c,book_id)?))?;
         let callback:Arc<dyn Fn(&str)+Send+Sync>=if chapter==idx {on_delta.clone()} else {Arc::new(|_|{})};
         result=Some(ensure_one(state,client,cfg,config,book_id,chapter,line,divergence.unwrap(),callback).await?);
@@ -75,11 +82,11 @@ pub async fn ensure_chapter(state:&AppState,client:&dyn LlmClient,cfg:&ProviderC
 async fn ensure_one(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfig,config:&RuntimeConfig,
     book:i64,idx:i64,line:i64,divergence:i64,on_delta:Arc<dyn Fn(&str)+Send+Sync>)->Result<TextVersion,String> {
     let text=if idx<divergence || idx==1 {
-        db(state,|c| match repo::selected_text(c,book,idx)? {
+        commit_db(state,client,|c| match repo::selected_text(c,book,idx)? {
             Some(selected)=>Ok(selected),None=>repo::text_version(c,book,idx,"original",None)
         })?
     } else {
-        let (mut ctx,deps,hard,current)=db(state,|c| {
+        let (mut ctx,deps,hard,current)=commit_db(state,client,|c| {
             guard_line_version(line,repo::line_version(c,book)?)?;
             let mut ctx=repo::generation_context(c,book,idx)?;
             let (deps,mut hard)=actual_dependencies(c,book,idx-1)?;
@@ -102,7 +109,7 @@ async fn ensure_one(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfig,co
         ctx.digest=digest.clone();
         match db(state,|c| repo::cached_generated(c,book,idx,&digest))? {
             Some(cached)=> {
-                db(state,|c| {guard_line_version(line,repo::line_version(c,book)?)?;
+                commit_db(state,client,|c| {guard_line_version(line,repo::line_version(c,book)?)?;
                     repo::activate_cached_for_config(c,cached.id,&digest,line,config)})?;
                 cached
             }
@@ -112,7 +119,7 @@ async fn ensure_one(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfig,co
                 let prose=client.stream_text(TextRequest {task:TaskKind::Write,messages,temperature:0.8,
                     max_tokens:Some(max_tokens)},on_delta).await.map_err(|e|format!("正文生成失败: {e}"))?;
                 if prose.trim().is_empty() {return Err("正文生成返回空文本，未保存章节".into());}
-                db(state,|c| repo::save_generated(c,book,idx,&prose,model,&digest,line))?
+                commit_db(state,client,|c| repo::save_generated(c,book,idx,&prose,model,&digest,line))?
             }
         }
     };
@@ -231,7 +238,7 @@ struct Precondition {key:String,event_key:String,subject_key:String,predicate:St
 async fn reconcile_next(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfig,config:&RuntimeConfig,
     text:&TextVersion,line:i64)->Result<(),String> {
     let next=text.chapter_idx+1;
-    let drift=db(state,|c| {
+    let drift=commit_db(state,client,|c| {
         guard_line_version(line,repo::line_version(c,text.book_id)?)?;
         let current=repo::internal_view(c,&query(text.book_id,"actual",text.chapter_idx,"chapter"))?;
         let reference=repo::internal_view(c,&query(text.book_id,"reference",text.chapter_idx,"chapter"))?;
@@ -248,11 +255,11 @@ async fn reconcile_next(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfi
     if !exists {return Ok(());}
     // Lazily obtain the evidenced original script for reconciliation only; it never
     // qualifies as actual selected future state after divergence.
-    let original=db(state,|c|repo::text_version(c,text.book_id,next,"original",None))?;
+    let original=commit_db(state,client,|c|repo::text_version(c,text.book_id,next,"original",None))?;
     if !db(state,|c|repo::extraction_matches(c,original.id,config))? {
         crate::core::kg_extract::extract(state,client,original,config,None).await?;
     }
-    let (ctx,deps,hard,current)=db(state,|c| {
+    let (ctx,deps,hard,current)=commit_db(state,client,|c| {
         guard_line_version(line,repo::line_version(c,text.book_id)?)?;
         let mut ctx=repo::generation_context(c,text.book_id,next)?;
         let user_input=ctx.spec.clone();
@@ -279,12 +286,13 @@ async fn reconcile_next(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfi
     let model=cfg.model_for(TaskKind::Merge).map_err(|e|e.to_string())?;
     let digest=dependency_digest(&ctx,config,&json!({"actual":deps,"preconditions":hard,"merge_model":model,"provider":cfg.id,
         "protocol":cfg.protocol,"base_url":cfg.base_url,"stage":"reconcile"}))?;
-    if resume_stage(true,db(state,|c|repo::spec_matches(c,text.book_id,next,&digest,line))?)==ResumeStage::Complete {return Ok(());}
+    if resume_stage(true,commit_db(state,client,|c|repo::spec_matches(c,text.book_id,next,&digest,line))?)==ResumeStage::Complete {return Ok(());}
     let mut messages=write_messages(&ctx,config,&hard,&current)?;
     messages[0].content=MERGE_SYSTEM.into();
     if !fits(&messages,config,Some(spec_schema())) {return Err("调和输入及schema超过预算，不能删减实际事实或用户约束".into());}
+    let max_tokens=u32::try_from(config.output_reserve).map_err(|_|"输出预算过大")?;
     let output=client.structured(StructuredRequest {task:TaskKind::Merge,messages,schema:spec_schema(),
-        schema_name:"kg_spec",temperature:0.0}).await.map_err(|e|e.to_string())?;
+        schema_name:"kg_spec",temperature:0.0,max_tokens}).await.map_err(|e|e.to_string())?;
     let validator=crate::llm::compile_schema(spec_schema());
     if let Err(error)=validator.validate(&output) {return Err(format!("调和schema校验失败: {error}"));}
     let mut result:SpecResult=serde_json::from_value(output).map_err(|e|e.to_string())?;
@@ -300,7 +308,7 @@ async fn reconcile_next(state:&AppState,client:&dyn LlmClient,cfg:&ProviderConfi
     adapted.revision=None;adapted.ready=true;adapted.drift_score=drift;adapted.reading_line_version=line;
     // Explicit user graph entries always override returned adapted entries (store reapplies tombstones).
     overlay_user(&mut adapted,&ctx.spec);
-    db(state,|c|repo::save_spec_with_preconditions(c,text.book_id,next,&adapted,&conditions,&digest,line))
+    commit_db(state,client,|c|repo::save_spec_with_preconditions(c,text.book_id,next,&adapted,&conditions,&digest,line))
 }
 
 fn normalize_spec_keys(result:&mut SpecResult,ctx:&GenerationContext,digest:&str) {

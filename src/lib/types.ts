@@ -33,7 +33,12 @@ export interface ProviderRow {
 export interface ExtractionStatus {
   book_id: number;
   job_id?: number | null;
+  kind?: string | null;
+  chapter_idx?: number | null;
   state: string;
   progress: number;
   error?: string | null;
+  phase?: string | null;
+  attempt?: number | null;
+  retry_after_ms?: number | null;
 }

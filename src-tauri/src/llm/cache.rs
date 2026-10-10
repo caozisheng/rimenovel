@@ -23,6 +23,8 @@ pub fn cache_key(provider_id: i64, model: &str, req: &StructuredRequest<'_>) -> 
         return None;
     }
     let mut h = Sha256::new();
+    update_part(&mut h, b"sdk-policy-v1");
+    update_part(&mut h, &req.max_tokens.to_le_bytes());
     h.update(provider_id.to_le_bytes());
     update_part(&mut h, model.as_bytes());
     update_part(&mut h, req.task.as_str().as_bytes());
@@ -111,6 +113,7 @@ mod tests {
             schema: &SCHEMA,
             schema_name: "t",
             temperature: temp,
+            max_tokens: 4096,
         }
     }
 
@@ -145,6 +148,14 @@ mod tests {
             cache_key(1, "m", &changed).unwrap().0,
             "schema name alone must not allow stale structured output reuse"
         );
+    }
+
+    #[test]
+    fn output_budget_changes_cache_eligibility() {
+        let request = req(0.0, TaskKind::Extract);
+        let mut smaller = request.clone();
+        smaller.max_tokens = 128;
+        assert_ne!(cache_key(1, "m", &request).unwrap().0, cache_key(1, "m", &smaller).unwrap().0);
     }
 
     #[test]

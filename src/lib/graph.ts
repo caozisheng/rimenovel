@@ -46,4 +46,4 @@ export interface GraphQuery { book_id: number; scope: "global" | "chapter"; purp
 export interface EditInput { book_id: number; scope: "global" | "chapter"; chapter_idx?: number | null; kind: "node" | "edge" | "event" | "directive" | "drift_pref"; action: "upsert" | "delete"; key?: string | null; data: Record<string, unknown> }
 export interface EditRecord { id: number; target_type: string; target_id: string; action: string; after_json: string | null; effective_from: number; active: boolean }
 export interface EvidenceView { key: string; chapter_idx: number; start_byte: number; end_byte: number; text: string; source: string }
-export interface GraphJobStatus { book_id: number; job_id?: number | null; progress: number; state: string; error?: string | null }
+export interface GraphJobStatus { book_id: number; job_id?: number | null; kind?: string | null; chapter_idx?: number | null; progress: number; state: string; error?: string | null; phase?: string | null; attempt?: number | null; retry_after_ms?: number | null }

@@ -51,6 +51,33 @@ fn failed_job_checkpoint_rolls_back_every_authoritative_record() {
     assert!(!ready(&conn, t.id).unwrap());
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM kg_records", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
 }
+
+#[test]
+fn cancelled_job_cannot_publish_a_revision_or_checkpoint() {
+    let (conn, book) = fixture();
+    let text = text_version(&conn, book, 1, "original", None).unwrap();
+    let job = crate::jobs::enqueue(&conn, book, crate::jobs::JobKind::GlobalExtract, serde_json::json!({"phase":"stage_b","provider_id":1})).unwrap();
+    conn.execute("UPDATE jobs SET state='cancelled' WHERE id=?1", [job]).unwrap();
+    assert!(commit_bundle(&conn, &text, &bundle(1), "dependencies", 0, Some(job)).is_err());
+    assert!(!ready(&conn, text.id).unwrap());
+    let payload = job_checkpoint(&conn, job).unwrap();
+    assert!(payload.get("committed_revisions").is_none());
+    assert_eq!(payload["phase"], "stage_b");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM kg_records", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn revision_checkpoint_preserves_live_call_observations() {
+    let (conn, book) = fixture();
+    let text = text_version(&conn, book, 1, "original", None).unwrap();
+    let job = crate::jobs::enqueue(&conn, book, crate::jobs::JobKind::GlobalExtract, serde_json::json!({"phase":"stage_b","attempt":2,"provider_id":3})).unwrap();
+    commit_bundle(&conn, &text, &bundle(1), "dependencies", 0, Some(job)).unwrap();
+    let payload = job_checkpoint(&conn, job).unwrap();
+    assert_eq!(payload["attempt"], 2);
+    assert_eq!(payload["provider_id"], 3);
+    assert_eq!(payload["phase"], "stage_b");
+    assert_eq!(payload["committed_revisions"]["1"]["text_version_id"], text.id);
+}
 #[test]
 fn future_intent_never_mutates_actual_and_revert_restores_digest() {
     let (conn, book) = fixture();

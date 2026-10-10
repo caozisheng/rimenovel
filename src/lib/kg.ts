@@ -71,7 +71,7 @@ export function parseEvidence(value: unknown): EvidenceView {
 }
 export function parseJobStatus(value: unknown): GraphJobStatus {
   const v = record(value, "job status");
-  return { book_id: parseNumber(v.book_id, "job.book_id"), job_id: v.job_id === null || v.job_id === undefined ? null : parseNumber(v.job_id, "job.job_id"), progress: parseNumber(v.progress, "job.progress"), state: stringValue(v.state, "job.state"), error: nullableString(v.error, "job.error") };
+  return { book_id: parseNumber(v.book_id, "job.book_id"), job_id: nullableNumber(v.job_id, "job.job_id"), kind: nullableString(v.kind, "job.kind"), chapter_idx: nullableNumber(v.chapter_idx, "job.chapter_idx"), progress: parseNumber(v.progress, "job.progress"), state: stringValue(v.state, "job.state"), error: nullableString(v.error, "job.error"), phase: nullableString(v.phase, "job.phase"), attempt: nullableNumber(v.attempt, "job.attempt"), retry_after_ms: nullableNumber(v.retry_after_ms, "job.retry_after_ms") };
 }
 async function call<T>(command: string, args: Record<string, unknown> | undefined, parser: (value: unknown) => T): Promise<T> { return parser(await invoke<unknown>(command, args)); }
 export function getGraph(query: GraphQuery): Promise<GraphView> { return call("get_graph", { query }, parseGraphView); }
@@ -81,6 +81,7 @@ export async function applyGraphEdit(input: EditInput): Promise<number> { return
 export function revertGraphEdit(bookId: number, editId: number): Promise<void> { return call("revert_graph_edit", { bookId, editId }, () => undefined); }
 export async function listGraphEdits(bookId: number): Promise<EditRecord[]> { const value = await call("list_graph_edits", { bookId }, (raw) => raw); if (!Array.isArray(value)) throw new Error("graph edits must be an array"); return value.map(parseEditRecord); }
 export async function startBookExtraction(bookId: number, providerId?: number): Promise<number> { return call("start_book_extraction", { bookId, ...(providerId === undefined ? {} : { providerId }) }, (value) => parseNumber(value, "job id")); }
+export function cancelBookJobs(bookId: number): Promise<void> { return call("cancel_book_jobs", { bookId }, () => undefined); }
 export function extractChapterGraph(bookId: number, chapterIdx: number, providerId?: number): Promise<void> { return call("extract_chapter_graph", { bookId, chapterIdx, ...(providerId === undefined ? {} : { providerId }) }, () => undefined); }
 export async function getChapter(bookId: number, idx: number): Promise<ChapterContent> { return parseChapterContent(await invoke<unknown>("get_chapter_cmd", { bookId, idx })); }
 export async function getExtractionStatuses(): Promise<GraphJobStatus[]> { const value = await call("get_extraction_statuses", undefined, (raw) => raw); if (!Array.isArray(value)) throw new Error("extraction statuses must be an array"); return value.map(parseJobStatus); }

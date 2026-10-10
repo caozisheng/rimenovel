@@ -7,22 +7,45 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractionStatus {
     pub book_id: i64,
+    pub job_id: i64,
+    pub kind: String,
+    pub chapter_idx: Option<i64>,
+    pub error: Option<String>,
+    pub phase: Option<String>,
+    pub attempt: Option<u32>,
+    pub retry_after_ms: Option<u64>,
     pub state: String, // queued|running|paused|done|failed|cancelled|none
     pub progress: f64,
 }
 
-/// 全部书的 global_extract job 状态（书架进度条数据源）
+/// Per-book background status: unfinished work first, otherwise the latest result.
 pub fn extraction_statuses(conn: &Connection) -> rusqlite::Result<Vec<ExtractionStatus>> {
     let mut stmt = conn.prepare(
-        "SELECT book_id, state, progress FROM jobs
-         WHERE kind = 'global_extract'
-         AND id IN (SELECT MAX(id) FROM jobs WHERE kind='global_extract' GROUP BY book_id)",
+        "SELECT book_id, state, progress, id, kind,
+                json_extract(payload_json, '$.chapter_idx'), error,
+                json_extract(payload_json, '$.phase'),
+                json_extract(payload_json, '$.attempt'),
+                json_extract(payload_json, '$.retry_after_ms')
+         FROM (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY book_id
+                 ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'paused' THEN 2 ELSE 3 END, id DESC
+             ) AS priority
+             FROM jobs WHERE kind IN ('global_extract','chapter_extract','generate','reconcile')
+         ) WHERE priority = 1",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(ExtractionStatus {
             book_id: r.get(0)?,
             state: r.get(1)?,
             progress: r.get(2)?,
+            job_id: r.get(3)?,
+            kind: r.get(4)?,
+            chapter_idx: r.get(5)?,
+            error: r.get(6)?,
+            phase: r.get(7)?,
+            attempt: r.get(8)?,
+            retry_after_ms: r.get(9)?,
         })
     })?;
     rows.collect()
@@ -42,6 +65,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blocked_successor_surfaces_predecessor_error_without_active_orphan() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        let predecessor = crate::jobs::enqueue(&conn, 1, crate::jobs::JobKind::ChapterExtract,
+            serde_json::json!({"chapter_idx":2})).unwrap();
+        let successor = crate::jobs::enqueue(&conn, 1, crate::jobs::JobKind::ChapterExtract,
+            serde_json::json!({"chapter_idx":3,"provider_id":9})).unwrap();
+        crate::jobs::mark_failed(&conn, predecessor, "HTTP 504: gateway timeout").unwrap();
+        crate::jobs::mark_blocked(&conn, successor, 2, "HTTP 504: gateway timeout").unwrap();
+        let status = extraction_statuses(&conn).unwrap().remove(0);
+        assert_eq!(status.job_id, successor);
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.phase.as_deref(), Some("failed"));
+        assert_eq!(status.chapter_idx, Some(3));
+        assert!(status.error.as_deref().unwrap().contains("第2章"));
+        assert!(status.error.as_deref().unwrap().contains("504"));
+        let active: i64 = conn.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running','paused')", [], |row| row.get(0)).unwrap();
+        assert_eq!(active, 0);
+        let retry = crate::jobs::enqueue(&conn, 1, crate::jobs::JobKind::GlobalExtract, serde_json::json!({})).unwrap();
+        assert_eq!(extraction_statuses(&conn).unwrap().remove(0).job_id, retry);
+    }
+
+    #[test]
+    fn cancelled_checkpoint_and_failed_error_survive_database_reopening() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rimenovel-job-status-{}-{unique}.sqlite", std::process::id()));
+        let cancelled;
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            crate::store::Db::new(&conn).migrate().unwrap();
+            cancelled = crate::jobs::enqueue(&conn, 1, crate::jobs::JobKind::GlobalExtract,
+                serde_json::json!({"provider_id":8,"committed_chapters":[1],"committed_revisions":{"1":{"revision":3}}})).unwrap();
+            crate::jobs::mark_running(&conn, cancelled).unwrap();
+            crate::jobs::set_progress(&conn, cancelled, 0.25, &serde_json::json!({"chapter_idx":2})).unwrap();
+            crate::jobs::set_phase(&conn, cancelled, "retry_wait", Some(2), Some(1000)).unwrap();
+            crate::jobs::cancel_book(&conn, 1).unwrap();
+            let failed = crate::jobs::enqueue(&conn, 2, crate::jobs::JobKind::ChapterExtract,
+                serde_json::json!({"chapter_idx":4})).unwrap();
+            crate::jobs::mark_failed(&conn, failed, "HTTP 504: gateway timeout; request-id=req-7").unwrap();
+            let mut statuses = extraction_statuses(&conn).unwrap();
+            statuses.sort_by_key(|status| status.book_id);
+            serde_json::to_value(statuses).unwrap()
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(crate::jobs::recover_orphans(&conn).unwrap(), 0);
+            let mut statuses = extraction_statuses(&conn).unwrap();
+            statuses.sort_by_key(|status| status.book_id);
+            assert_eq!(serde_json::to_value(statuses).unwrap(), before);
+            assert_eq!(before[0]["state"], "cancelled");
+            assert_eq!(before[0]["progress"], 0.25);
+            assert_eq!(before[0]["phase"], "cancelled");
+            assert_eq!(before[1]["error"], "HTTP 504: gateway timeout; request-id=req-7");
+            let raw: String = conn.query_row("SELECT payload_json FROM jobs WHERE id=?1", [cancelled], |row| row.get(0)).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(payload["committed_chapters"], serde_json::json!([1]));
+            assert_eq!(payload["committed_revisions"]["1"]["revision"], 3);
+            assert_eq!(payload["provider_id"], 8);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retry_and_cancellation_metadata_survive_status_reload() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        let id = crate::jobs::enqueue(&conn, 1, crate::jobs::JobKind::GlobalExtract,
+            serde_json::json!({"chapter_idx":2,"committed_chapters":[1],"provider_id":9})).unwrap();
+        crate::jobs::set_phase(&conn, id, "retry_wait", Some(2), Some(900)).unwrap();
+        let status = extraction_statuses(&conn).unwrap().remove(0);
+        assert_eq!(status.phase.as_deref(), Some("retry_wait"));
+        assert_eq!(status.attempt, Some(2));
+        assert_eq!(status.retry_after_ms, Some(900));
+        assert_eq!(status.chapter_idx, Some(2));
+        crate::jobs::cancel_book(&conn, 1).unwrap();
+        crate::jobs::recover_orphans(&conn).unwrap();
+        let data = serde_json::to_value(extraction_statuses(&conn).unwrap().remove(0)).unwrap();
+        assert_eq!(data["state"], "cancelled");
+        assert_eq!(data["phase"], "cancelled");
+        assert_eq!(data["attempt"], 2);
+        assert!(data["retry_after_ms"].is_null());
+        assert_eq!(data["chapter_idx"], 2);
+    }
+
+    #[test]
     fn latest_job_per_book_returned() {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::Db::apply_pragmas(&conn).unwrap();
@@ -59,5 +167,47 @@ mod tests {
         let b1 = v.iter().find(|s| s.book_id == 1).unwrap();
         assert_eq!(b1.state, "running");
         assert!((b1.progress - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn failed_chapter_task_remains_visible_after_reopening() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json,error) VALUES(1,'chapter_extract','failed',0,'{\"chapter_idx\":1}','HTTP 504: gateway timeout')", []).unwrap();
+        let statuses = extraction_statuses(&conn).unwrap();
+        let status = statuses.iter().find(|status| status.book_id == 1)
+            .expect("failed chapter extraction must be visible to the workbench");
+        let data = serde_json::to_value(status).unwrap();
+        assert_eq!(data["state"], "failed");
+        assert_eq!(data["error"], "HTTP 504: gateway timeout");
+        assert_eq!(data["kind"], "chapter_extract");
+        assert_eq!(data["chapter_idx"], 1);
+        assert_eq!(data["job_id"], conn.last_insert_rowid());
+    }
+
+    #[test]
+    fn unfinished_book_job_is_not_hidden_by_completed_foreground_chapter() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress) VALUES(1,'global_extract','running',0.25)", []).unwrap();
+        let running = conn.last_insert_rowid();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress) VALUES(1,'chapter_extract','done',1)", []).unwrap();
+        let data = serde_json::to_value(&extraction_statuses(&conn).unwrap()[0]).unwrap();
+        assert_eq!(data["state"], "running");
+        assert_eq!(data["progress"], 0.25);
+        assert_eq!(data["job_id"], running);
+    }
+
+    #[test]
+    fn running_stage_is_visible_even_when_prefetch_successor_is_queued() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json) VALUES(1,'global_extract','running',0.25,'{\"phase\":\"stage_b\",\"attempt\":2}')", []).unwrap();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json) VALUES(1,'chapter_extract','queued',0,'{\"phase\":\"queued\",\"chapter_idx\":2}')", []).unwrap();
+        let statuses = extraction_statuses(&conn).unwrap();
+        let status = &statuses[0];
+        assert_eq!(status.state, "running");
+        assert_eq!(status.phase.as_deref(), Some("stage_b"));
+        assert_eq!(status.attempt, Some(2));
     }
 }

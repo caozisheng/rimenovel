@@ -4,6 +4,7 @@ import type { ProviderRow } from "./types";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 const emptyForm = {
+  id: null as number | null,
   name: "",
   protocol: "openai",
   base_url: "",
@@ -27,6 +28,23 @@ export const providerPanel = reactive({
 
 export function resetForm(): void {
   providerPanel.form = { ...emptyForm };
+  providerPanel.testResult = "";
+}
+
+export function editProvider(row: ProviderRow): void {
+  providerPanel.form = {
+    id: row.id,
+    name: row.name,
+    protocol: row.protocol,
+    base_url: row.base_url,
+    model_extract: row.model_extract ?? "",
+    model_write: row.model_write ?? "",
+    model_merge: row.model_merge ?? "",
+    api_key: "",
+    context_limit: row.context_limit ?? 32768,
+    output_reserve: row.output_reserve ?? 4096,
+  };
+  providerPanel.error = "";
   providerPanel.testResult = "";
 }
 
@@ -77,6 +95,7 @@ export async function deleteProvider(id: number): Promise<void> {
   providerPanel.error = "";
   try {
     await tauriInvoke("provider_delete", { id });
+    if (providerPanel.form.id === id) resetForm();
     await refreshProviders();
   } catch (e) {
     providerPanel.error = String(e);
@@ -96,4 +115,5 @@ export async function openPanel(): Promise<void> {
 
 export function closePanel(): void {
   providerPanel.visible = false;
+  resetForm();
 }

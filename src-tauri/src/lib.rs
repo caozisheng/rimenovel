@@ -75,6 +75,7 @@ pub fn run() {
             commands::kg::revert_graph_edit,
             commands::kg::list_graph_edits,
             commands::kg::start_book_extraction,
+            commands::kg::cancel_book_jobs,
             commands::kg::extract_chapter_graph
         ])
         .run(tauri::generate_context!())

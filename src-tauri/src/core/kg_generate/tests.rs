@@ -225,6 +225,9 @@ impl LlmClient for RecordedClient {
             other=>Err(crate::llm::LlmError::Schema(format!("unexpected recorded request {other}")))
         }
     }
+    async fn structured_with_usage(&self, req: StructuredRequest<'_>) -> Result<crate::llm::StructuredResponse, crate::llm::LlmError> {
+        Ok(crate::llm::StructuredResponse { value: self.structured(req).await?, usage: None })
+    }
     async fn stream_text(&self,_req:TextRequest,on_delta:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,crate::llm::LlmError> {
         self.writes.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
         on_delta("真实保存的生成文本");Ok("真实保存的生成文本".into())

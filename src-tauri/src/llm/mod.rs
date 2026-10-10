@@ -3,6 +3,7 @@
 pub mod anthropic;
 pub mod cache;
 pub mod openai;
+pub mod policy;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,10 +41,11 @@ pub struct ChatMessage {
 pub struct StructuredRequest<'a> {
     pub task: TaskKind,
     pub messages: Vec<ChatMessage>,
-    /// JSON Schema（如 docs/schemas/chapter-graph.schema.json 编译期内嵌）
+    /// Exact versioned JSON Schema; not a generated SDK schema.
     pub schema: &'a Value,
     pub schema_name: &'a str,
     pub temperature: f32, // 抽取/调和恒 0.0
+    pub max_tokens: u32,
 }
 
 /// 正文生成请求（流式）
@@ -60,13 +62,17 @@ pub enum LlmError {
     #[error("网络错误: {0}")]
     Network(String),
     #[error("限流/服务端错误 {status}: {body}")]
-    Server { status: u16, body: String },
+    Server { status: u16, body: String, retry_after: Option<std::time::Duration>, request_id: Option<String> },
     #[error("schema 校验失败: {0}")]
     Schema(String),
     #[error("流中断: {0}")]
     Stream(String),
     #[error("配置错误: {0}")]
     Config(String),
+    #[error("请求已取消")]
+    Cancelled,
+    #[error("模型请求超时")]
+    Timeout,
 }
 
 #[derive(Clone, Debug)]
@@ -82,24 +88,21 @@ pub(crate) fn reported_usage(response:&Value, input_key:&str, output_key:&str) -
     (input >= 0 && output >= 0).then_some((input,output))
 }
 
-pub(crate) fn combined_usage(left:Option<(i64,i64)>, right:Option<(i64,i64)>) -> Option<(i64,i64)> {
-    match (left,right) {
-        (Some((li,lo)),Some((ri,ro))) => Some((li + ri,lo + ro)),
-        _ => None,
-    }
-}
 
 /// 协议客户端抽象：openai.rs / anthropic.rs 各自实现
 #[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
-    /// 结构化输出：协议实现负责请求组装、响应解析、jsonschema 校验、
-    /// 失败重试 1 次、降级 prompt 内嵌 schema 再 1 次（实现侧约定）。
-    async fn structured(&self, req: StructuredRequest<'_>) -> Result<Value, LlmError>;
-
-    /// Implementations that receive provider usage override this without extra requests.
-    async fn structured_with_usage(&self, req:StructuredRequest<'_>) -> Result<StructuredResponse,LlmError> {
-        Ok(StructuredResponse { value:self.structured(req).await?, usage:None })
+    /// Each adapter performs one attempt. The policy wrapper owns retries.
+    async fn structured(&self, req: StructuredRequest<'_>) -> Result<Value, LlmError> {
+        Ok(self.structured_with_usage(req).await?.value)
     }
+    async fn structured_with_usage(&self, req: StructuredRequest<'_>) -> Result<StructuredResponse, LlmError>;
+
+    /// Cancellation is checked both around awaits and before durable writes.
+    fn check_cancelled(&self) -> Result<(), LlmError> { Ok(()) }
+
+    /// Serializes cancellation against a host durable operation. No network awaits inside.
+    fn commit_guard(&self) -> Result<Option<policy::CommitGuard<'_>>, LlmError> { self.check_cancelled()?; Ok(None) }
 
     /// 流式正文生成：on_delta 逐块回调（token 流透传到前端 event）。
     /// Arc<dyn Fn> 避免 async_trait 脱糖下 &dyn Fn(&str) 的 HRTB 生命周期冲突。
@@ -139,6 +142,15 @@ impl ProviderConfig {
             ))
         })
     }
+}
+
+pub fn server_error(status: u16, body: String, headers: &reqwest::header::HeaderMap) -> LlmError {
+    let retry_after = headers.get("retry-after").and_then(|value| value.to_str().ok()).and_then(|value| {
+        value.parse::<u64>().ok().map(std::time::Duration::from_secs)
+            .or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(std::time::SystemTime::now()).unwrap_or_default()))
+    });
+    let request_id = ["x-request-id", "request-id"].iter().find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()).map(str::to_owned));
+    LlmError::Server { status, body, retry_after, request_id }
 }
 
 #[cfg(test)]
