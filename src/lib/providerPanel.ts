@@ -4,6 +4,7 @@ import type { ProviderRow } from "./types";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 const emptyForm = {
+  id: null as number | null,
   name: "",
   protocol: "openai",
   base_url: "",
@@ -11,6 +12,8 @@ const emptyForm = {
   model_write: "",
   model_merge: "",
   api_key: "",
+  context_limit: 32768,
+  output_reserve: 4096,
 };
 
 export const providerPanel = reactive({
@@ -28,11 +31,34 @@ export function resetForm(): void {
   providerPanel.testResult = "";
 }
 
+export function editProvider(row: ProviderRow): void {
+  providerPanel.form = {
+    id: row.id,
+    name: row.name,
+    protocol: row.protocol,
+    base_url: row.base_url,
+    model_extract: row.model_extract ?? "",
+    model_write: row.model_write ?? "",
+    model_merge: row.model_merge ?? "",
+    api_key: "",
+    context_limit: row.context_limit ?? 32768,
+    output_reserve: row.output_reserve ?? 4096,
+  };
+  providerPanel.error = "";
+  providerPanel.testResult = "";
+}
+
 async function refreshProviders(): Promise<void> {
   providerPanel.rows = await tauriInvoke<ProviderRow[]>("provider_list");
 }
 
 export async function saveProvider(): Promise<void> {
+  const contextLimit = providerPanel.form.context_limit ?? 32768;
+  const outputReserve = providerPanel.form.output_reserve ?? 4096;
+  if (contextLimit <= 0 || outputReserve <= 0 || outputReserve >= contextLimit) {
+    providerPanel.error = "输出预留必须大于 0 且小于上下文上限";
+    return;
+  }
   providerPanel.saving = true;
   providerPanel.error = "";
   try {
@@ -69,6 +95,7 @@ export async function deleteProvider(id: number): Promise<void> {
   providerPanel.error = "";
   try {
     await tauriInvoke("provider_delete", { id });
+    if (providerPanel.form.id === id) resetForm();
     await refreshProviders();
   } catch (e) {
     providerPanel.error = String(e);
@@ -88,4 +115,5 @@ export async function openPanel(): Promise<void> {
 
 export function closePanel(): void {
   providerPanel.visible = false;
+  resetForm();
 }

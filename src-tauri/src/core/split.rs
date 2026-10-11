@@ -28,10 +28,12 @@ impl Default for SplitOptions {
 
 /// 章节标题正则（按优先级顺序尝试，取首个匹配数达标的规则）
 /// 1. 第X章/节/卷/回/集/部（中文数字或阿拉伯数字，可含空格/标点尾巴）
-/// 2. Chapter N / CHAPTER N
-/// 3. 数字章（"1. 标题" / "一、标题" / "一　标题"）
+/// 2. 第X话（需空格或标点分隔标题，避免“第一话题”误切）
+/// 3. Chapter N / CHAPTER N
+/// 4. 数字章（"1. 标题" / "一、标题" / "一　标题"）
 const PATTERNS: &[&str] = &[
     r"^\s*第\s*[0-9〇零一二两三四五六七八九十百千万亿]+\s*[章节卷回集部]\s*[^\n]{0,30}$",
+    r"^\s*第\s*[0-9〇零一二两三四五六七八九十百千万亿]+\s*话(?:[\s：:、.．]+[^\n]{1,30})?\s*$",
     r"^\s*(?:Chapter|CHAPTER|chapter)\s+\d+.*$",
     r"^\s*[0-9〇零一二两三四五六七八九十]+\s*[、.．]\s*[^\n]{1,30}$",
     r"^\s*[0-9〇零一二两三四五六七八九十]+[\s　]+[^\n]{1,30}$",
@@ -117,7 +119,7 @@ pub fn split_txt(text: &str, opts: &SplitOptions) -> Vec<RawChapter> {
             text: body.join("\n").trim().to_string(),
         });
     }
-
+    chapters.retain(|chapter| !chapter.text.trim().is_empty());
     // 序号按出现顺序重编
     for (i, ch) in chapters.iter_mut().enumerate() {
         ch.idx = (i + 1) as i64;
@@ -156,6 +158,18 @@ mod tests {
             },
         );
         assert_eq!(cs2.len(), 2);
+    }
+
+    #[test]
+    fn splits_episode_headings_but_not_numbered_discussion_topics() {
+        let text = "引子\n背景。\n第一话 古瓶\n阿豪与藤明月出发。\n第二话 离奇的死亡事件\n老马讲述经过。\n";
+        let chapters = split_txt(text, &SplitOptions::default());
+        assert_eq!(chapters.iter().map(|chapter| chapter.title.as_str()).collect::<Vec<_>>(),
+            ["前言", "第一话 古瓶", "第二话 离奇的死亡事件"]);
+        assert_eq!(chapters[1].text, "阿豪与藤明月出发。");
+        assert_eq!(chapters[2].text, "老马讲述经过。");
+        let topics = "第一话题是时间。\n讨论正文。\n第二话题是关系。\n继续讨论正文。";
+        assert_eq!(split_txt(topics, &SplitOptions::default())[0].text, topics);
     }
 
     #[test]
@@ -210,5 +224,18 @@ mod tests {
         let cs = split_txt(txt, &SplitOptions::default());
         assert_eq!(cs.len(), 3);
         assert_eq!((cs[0].idx, cs[1].idx, cs[2].idx), (1, 2, 3));
+    }
+    #[test]
+    fn drops_empty_chapters_created_by_adjacent_headings() {
+        let text = "第一章\n\n第二章\n正文\n第三章\n";
+        let chapters = split_txt(text, &SplitOptions::default());
+        assert_eq!(chapters.iter().map(|chapter| chapter.title.as_str()).collect::<Vec<_>>(), ["第二章"]);
+        assert_eq!(chapters[0].text, "正文");
+    }
+
+    #[test]
+    fn empty_heading_only_input_has_no_chapters() {
+        let chapters = split_txt("第一章\n第二章\n", &SplitOptions::default());
+        assert!(chapters.is_empty());
     }
 }

@@ -7,6 +7,8 @@ export interface Book {
   source_path: string;
 }
 
+export type ReadingMode = "original" | "rewrite";
+export type RewriteStatus = "ready" | "inherited" | "generating" | "unavailable";
 export interface ChapterMeta {
   idx: number;
   title: string;
@@ -17,8 +19,10 @@ export interface ChapterContent {
   title: string;
   content: string;
   source: string;
+  reading_mode: ReadingMode;
+  rewrite_status: RewriteStatus;
+  graph_error?: string | null;
 }
-
 export interface ProviderRow {
   id: number;
   name: string;
@@ -27,10 +31,18 @@ export interface ProviderRow {
   model_extract: string | null;
   model_write: string | null;
   model_merge: string | null;
+  context_limit: number | null;
+  output_reserve: number | null;
 }
-
 export interface ExtractionStatus {
   book_id: number;
+  job_id?: number | null;
+  kind?: string | null;
+  chapter_idx?: number | null;
   state: string;
   progress: number;
+  error?: string | null;
+  phase?: string | null;
+  attempt?: number | null;
+  retry_after_ms?: number | null;
 }

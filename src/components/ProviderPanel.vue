@@ -1,18 +1,19 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NModal, NSelect, type FormInst } from "naive-ui";
-import { closePanel, deleteProvider, providerPanel, saveProvider, testProvider } from "../lib/providerPanel";
+import { computed, ref, watch } from "vue";
+import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, type FormInst } from "naive-ui";
+import { closePanel, deleteProvider, editProvider, providerPanel, resetForm, saveProvider, testProvider } from "../lib/providerPanel";
 
 const form = ref<FormInst | null>(null);
 const protocolOptions = [
   { label: "OpenAI 兼容", value: "openai" },
   { label: "Anthropic", value: "anthropic" },
 ];
-const rules = {
+const rules = computed(() => ({
   name: { required: true, message: "请输入名称", trigger: ["input", "blur"] },
   base_url: { required: true, message: "请输入 Base URL", trigger: ["input", "blur"] },
-  api_key: { required: true, message: "请输入 API Key", trigger: ["input", "blur"] },
-};
+  api_key: { required: providerPanel.form.id === null, message: "请输入 API Key", trigger: ["input", "blur"] },
+}));
+watch(() => providerPanel.form.id, () => form.value?.restoreValidation());
 async function submit(): Promise<void> {
   try {
     await form.value?.validate();
@@ -35,7 +36,7 @@ async function submit(): Promise<void> {
     @close="closePanel"
   >
     <NAlert v-if="providerPanel.error" type="error" class="notice">{{ providerPanel.error }}</NAlert>
-    <NForm ref="form" :model="providerPanel.form" :rules="rules" @submit.prevent="submit">
+    <NForm ref="form" :model="providerPanel.form" :rules="rules" :disabled="providerPanel.saving" @submit.prevent="submit">
       <div class="row">
         <NFormItem label="名称" path="name">
           <NInput v-model:value="providerPanel.form.name" placeholder="my-openrouter" />
@@ -48,14 +49,21 @@ async function submit(): Promise<void> {
         <NInput v-model:value="providerPanel.form.base_url" placeholder="https://api.example.com/v1" />
       </NFormItem>
       <NFormItem label="API Key" path="api_key">
-        <NInput v-model:value="providerPanel.form.api_key" type="password" show-password-on="click" placeholder="sk-..." :input-props="{ autocomplete: 'off' }" />
+        <NInput v-model:value="providerPanel.form.api_key" type="password" show-password-on="click" :placeholder="providerPanel.form.id === null ? 'sk-...' : '留空保留已有密钥；输入新密钥则替换'" :input-props="{ autocomplete: 'off' }" />
       </NFormItem>
       <div class="row three">
         <NFormItem label="抽取模型"><NInput v-model:value="providerPanel.form.model_extract" placeholder="低价档" /></NFormItem>
         <NFormItem label="合并模型"><NInput v-model:value="providerPanel.form.model_merge" placeholder="中价档" /></NFormItem>
         <NFormItem label="写作模型"><NInput v-model:value="providerPanel.form.model_write" placeholder="高质档" /></NFormItem>
       </div>
-      <NButton attr-type="submit" type="primary" :loading="providerPanel.saving" :disabled="providerPanel.saving">保存</NButton>
+      <div class="row">
+        <NFormItem label="上下文上限"><NInputNumber v-model:value="providerPanel.form.context_limit" :min="1" placeholder="32768" /></NFormItem>
+        <NFormItem label="输出预留"><NInputNumber v-model:value="providerPanel.form.output_reserve" :min="1" placeholder="4096" /></NFormItem>
+      </div>
+      <div class="item-ops">
+        <NButton attr-type="submit" type="primary" :loading="providerPanel.saving" :disabled="providerPanel.saving">{{ providerPanel.form.id === null ? '保存' : '保存更改' }}</NButton>
+        <NButton v-if="providerPanel.form.id !== null" :disabled="providerPanel.saving" @click="resetForm">取消编辑</NButton>
+      </div>
     </NForm>
     <ul v-if="providerPanel.rows.length" class="list">
       <li v-for="p in providerPanel.rows" :key="p.id" class="item">
@@ -63,10 +71,12 @@ async function submit(): Promise<void> {
           <strong>{{ p.name }}</strong>
           <span class="meta">{{ p.protocol }} · {{ p.base_url }}</span>
           <span class="meta">抽取 {{ p.model_extract ?? '—' }} / 合并 {{ p.model_merge ?? '—' }} / 写作 {{ p.model_write ?? '—' }}</span>
+          <span class="meta">预算 {{ p.context_limit ?? 32768 }} tokens · 预留 {{ p.output_reserve ?? 4096 }}</span>
         </div>
         <div class="item-ops">
+          <NButton size="small" :disabled="providerPanel.saving" @click="editProvider(p)">编辑</NButton>
           <NButton size="small" :disabled="providerPanel.testing" @click="testProvider(p.id)">测连</NButton>
-          <NButton size="small" type="error" secondary @click="deleteProvider(p.id)">删除</NButton>
+          <NButton size="small" type="error" secondary :disabled="providerPanel.saving" @click="deleteProvider(p.id)">删除</NButton>
         </div>
       </li>
     </ul>

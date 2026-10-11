@@ -5,8 +5,8 @@ import type { Book, ExtractionStatus } from "./lib/types";
 import ReaderView from "./components/ReaderView.vue";
 import ProviderPanel from "./components/ProviderPanel.vue";
 import { openPanel } from "./lib/providerPanel";
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { deleteBook, importBook, listBooks, pickNovelFile } from "./lib/ipc";
+import { getExtractionStatuses, onKgEvent, parseJobStatus, startBookExtraction } from "./lib/kg";
 import { applyTheme, currentTheme, type ThemeMode } from "./lib/theme";
 import {
   NButton,
@@ -30,6 +30,7 @@ const deletingBookId = ref<number | null>(null);
 const pendingDeleteBook = ref<Book | null>(null);
 const showDeleteDialog = ref(false);
 const extraction = ref<Record<number, ExtractionStatus>>({});
+const jobStateLabels: Record<string, string> = { queued: "等待执行", running: "后台处理中", paused: "已暂停", failed: "任务失败", cancelled: "已取消" };
 const themeMode = ref<ThemeMode>(currentTheme());
 const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const systemDark = ref(colorScheme.matches);
@@ -38,6 +39,7 @@ function onSystemThemeChange(event: MediaQueryListEvent): void {
 }
 colorScheme.addEventListener("change", onSystemThemeChange);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let stopJobProgress: (() => void) | null = null;
 
 // Naive UI 主题与 CSS 令牌同步: dark 显式, auto 跟随系统
 const naiveTheme = computed(() =>
@@ -67,12 +69,13 @@ function onThemeChange(mode: ThemeMode): void {
 }
 
 async function refreshExtraction(): Promise<void> {
-  try {
-    const list = await tauriInvoke<ExtractionStatus[]>("get_extraction_statuses");
-    extraction.value = Object.fromEntries(list.map((s) => [s.book_id, s]));
-  } catch {
-    /* 非 Tauri 环境忽略 */
-  }
+  try { extraction.value = Object.fromEntries((await getExtractionStatuses()).map((status) => [status.book_id, status])); }
+  catch { /* 非 Tauri 环境忽略 */ }
+}
+async function retryExtraction(bookId: number): Promise<void> {
+  error.value = "";
+  try { await startBookExtraction(bookId); await refreshExtraction(); }
+  catch (e) { error.value = String(e); }
 }
 
 async function onImport(): Promise<void> {
@@ -122,19 +125,19 @@ async function confirmDelete(): Promise<void> {
 }
 
 onMounted(async () => {
-  try {
-    books.value = await listBooks();
-  } catch {
-    books.value = []; // 非 Tauri 环境（纯浏览器 dev）静默空书架
-  }
+  try { books.value = await listBooks(); }
+  catch { books.value = []; }
   await refreshExtraction();
+  stopJobProgress = await onKgEvent("job:progress", parseJobStatus, () => { void refreshExtraction(); });
   pollTimer = setInterval(() => void refreshExtraction(), 3000);
 });
 
 onUnmounted(() => {
   if (pollTimer !== null) clearInterval(pollTimer);
+  stopJobProgress?.();
   colorScheme.removeEventListener("change", onSystemThemeChange);
 });
+
 </script>
 
 <template>
@@ -179,9 +182,11 @@ onUnmounted(() => {
               round
             >
               {{ extraction[b.id].state === "done"
-                ? "图谱就绪"
-                : `${extraction[b.id].state} ${Math.round(extraction[b.id].progress * 100)}%` }}
+                ? (extraction[b.id].kind === 'global_extract' ? "整书图谱就绪" : "后台任务完成")
+                : `${jobStateLabels[extraction[b.id].state] ?? extraction[b.id].state} ${Math.round(extraction[b.id].progress * 100)}%` }}
             </NTag>
+            <NButton v-if="extraction[b.id]?.state === 'failed'" size="small" type="warning" @click="retryExtraction(b.id)">重试抽取</NButton>
+            <span v-if="extraction[b.id]?.state === 'failed' && extraction[b.id]?.error" class="job-error">{{ extraction[b.id]?.error }}</span>
             <NButton
               size="small"
               quaternary
@@ -252,7 +257,7 @@ onUnmounted(() => {
 .book-title:focus-visible { outline: none; }
 .meta { color: var(--color-text-secondary); font-size: 0.9em; }
 .empty { margin-top: var(--space-xl); }
-.error { color: var(--color-danger); }
+.job-error { color: var(--color-danger); font-size: 12px; max-width: 220px; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
   .bookshelf { padding: var(--space-md); }
   .shelf-header { gap: var(--space-sm); }

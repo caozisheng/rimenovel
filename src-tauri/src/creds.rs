@@ -11,10 +11,14 @@ pub struct Vault {
     cache: Mutex<HashMap<String, String>>,
 }
 
+static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub fn configure_directory(path: PathBuf) -> Result<(), String> {
+    DIRECTORY.set(path).map_err(|_| "凭据目录已初始化".to_string())
+}
+
 static VAULT: std::sync::LazyLock<Vault> = std::sync::LazyLock::new(|| {
-    let dir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("data");
+    let dir = DIRECTORY.get().cloned().or_else(|| std::env::var_os("RIMENOVEL_DATA_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("data"));
     let _ = std::fs::create_dir_all(&dir);
     Vault {
         path: dir.join("creds.json"),

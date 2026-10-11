@@ -1,5 +1,5 @@
 // 统一 Tauri IPC 封装（薄 API 层：稳定命令名 + 参数类型）
-import type { Book, ChapterMeta, ChapterContent } from "./types";
+import type { Book, ChapterMeta, ChapterContent, ReadingMode } from "./types";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -19,8 +19,8 @@ export async function getChapterTitles(bookId: number): Promise<ChapterMeta[]> {
   return tauriInvoke<ChapterMeta[]>("get_chapter_titles", { bookId });
 }
 
-export async function getChapter(bookId: number, idx: number): Promise<ChapterContent> {
-  return tauriInvoke<ChapterContent>("get_chapter_cmd", { bookId, idx });
+export async function getChapter(bookId: number, idx: number, mode: ReadingMode = "original"): Promise<ChapterContent> {
+  return tauriInvoke<ChapterContent>("get_chapter_cmd", { bookId, idx, mode });
 }
 
 /** 桌面端文件选择；用户取消返回 null */

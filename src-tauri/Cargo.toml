@@ -27,9 +27,16 @@ async-trait = "0.1.92"
 jsonschema = "0.58.6"
 thiserror = "2.0.21"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
+async-openai = { version = "=0.42.2", default-features = false, features = ["rustls", "chat-completion", "byot", "middleware"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+httpdate = "1"
+rand = "0.9"
+tower = { version = "0.5", features = ["util"] }
+bytes = "1"
+http = "1"
 parking_lot = "0.12.5"
 futures-util = "0.3.34"
-tokio = { version = "1.53.2", features = ["time", "rt", "macros"] }
+tokio = { version = "1.53.2", features = ["time", "rt", "macros", "sync"] }
 sha2 = "0.11.0"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -42,3 +49,4 @@ strip = true
 
 [dev-dependencies]
 wiremock = "0.6.5"
+tokio = { version = "1.53.2", features = ["test-util"] }

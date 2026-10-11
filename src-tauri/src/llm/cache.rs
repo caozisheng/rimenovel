@@ -6,8 +6,16 @@ use crate::llm::{StructuredRequest, TaskKind};
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 
 pub struct CacheKey(pub String);
+
+const UNKNOWN_TOKEN_COUNT: i64 = -1;
+
+fn update_part(h: &mut Sha256, bytes: &[u8]) {
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
+}
 
 pub fn cache_key(provider_id: i64, model: &str, req: &StructuredRequest<'_>) -> Option<CacheKey> {
     // 仅确定性调用可缓存
@@ -15,18 +23,23 @@ pub fn cache_key(provider_id: i64, model: &str, req: &StructuredRequest<'_>) -> 
         return None;
     }
     let mut h = Sha256::new();
+    update_part(&mut h, b"sdk-policy-v1");
+    update_part(&mut h, &req.max_tokens.to_le_bytes());
     h.update(provider_id.to_le_bytes());
-    h.update(model.as_bytes());
-    h.update(req.schema_name.as_bytes());
-    h.update(req.temperature.to_le_bytes());
+    update_part(&mut h, model.as_bytes());
+    update_part(&mut h, req.task.as_str().as_bytes());
+    update_part(&mut h, req.schema_name.as_bytes());
+    update_part(&mut h, &req.temperature.to_le_bytes());
+    // A schema name is not a schema identity: strict output cache reuse must
+    // change when any nested shape, enum, or required field changes.
+    update_part(&mut h, &serde_json::to_vec(req.schema).expect("schema is JSON"));
     for m in &req.messages {
-        h.update(m.role.as_bytes());
-        h.update([0u8]);
-        h.update(m.content.as_bytes());
-        h.update([0u8]);
+        update_part(&mut h, m.role.as_bytes());
+        update_part(&mut h, m.content.as_bytes());
     }
     let digest = h.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let mut hex = String::with_capacity(64);
+    for byte in digest { write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail"); }
     Some(CacheKey(hex))
 }
 
@@ -47,9 +60,9 @@ pub fn cache_put(
     conn: &Connection,
     key: &CacheKey,
     response: &Value,
-    tokens_in: i64,
-    tokens_out: i64,
+    usage: Option<(i64, i64)>,
 ) -> rusqlite::Result<()> {
+    let (tokens_in, tokens_out) = usage.unwrap_or((UNKNOWN_TOKEN_COUNT, UNKNOWN_TOKEN_COUNT));
     conn.execute(
         "INSERT OR REPLACE INTO llm_cache (hash, response_json, tokens_in, tokens_out) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![key.0, serde_json::to_string(response).unwrap(), tokens_in, tokens_out],
@@ -62,9 +75,11 @@ pub fn record_usage(
     provider_id: i64,
     book_id: Option<i64>,
     task: TaskKind,
-    tokens_in: i64,
-    tokens_out: i64,
+    usage: Option<(i64, i64)>,
 ) -> rusqlite::Result<()> {
+    let Some((tokens_in, tokens_out)) = usage else {
+        return Ok(());
+    };
     conn.execute(
         "INSERT INTO llm_usage (provider_id, book_id, task, tokens_in, tokens_out) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![provider_id, book_id, task.as_str(), tokens_in, tokens_out],
@@ -98,6 +113,7 @@ mod tests {
             schema: &SCHEMA,
             schema_name: "t",
             temperature: temp,
+            max_tokens: 4096,
         }
     }
 
@@ -121,16 +137,48 @@ mod tests {
     }
 
     #[test]
-    fn cache_roundtrip_and_usage() {
+    fn schema_contents_are_part_of_the_cache_key() {
+        let base = req(0.0, TaskKind::Extract);
+        let mut changed = base.clone();
+        static OTHER_SCHEMA: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({"type": "object", "required": ["answer"]}));
+        changed.schema = &OTHER_SCHEMA;
+        assert_ne!(
+            cache_key(1, "m", &base).unwrap().0,
+            cache_key(1, "m", &changed).unwrap().0,
+            "schema name alone must not allow stale structured output reuse"
+        );
+    }
+
+    #[test]
+    fn output_budget_changes_cache_eligibility() {
+        let request = req(0.0, TaskKind::Extract);
+        let mut smaller = request.clone();
+        smaller.max_tokens = 128;
+        assert_ne!(cache_key(1, "m", &request).unwrap().0, cache_key(1, "m", &smaller).unwrap().0);
+    }
+
+    #[test]
+    fn cache_roundtrip_and_known_usage() {
         let conn = db();
         let key = cache_key(1, "m", &req(0.0, TaskKind::Extract)).unwrap();
         assert!(cache_get(&conn, &key).unwrap().is_none());
-        cache_put(&conn, &key, &json!({"ok": true}), 100, 50).unwrap();
+        cache_put(&conn, &key, &json!({"ok": true}), Some((100, 50))).unwrap();
         assert_eq!(cache_get(&conn, &key).unwrap().unwrap()["ok"], true);
-        record_usage(&conn, 1, Some(7), TaskKind::Extract, 100, 50).unwrap();
+        record_usage(&conn, 1, Some(7), TaskKind::Extract, Some((100, 50))).unwrap();
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM llm_usage", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn unavailable_usage_is_not_recorded_as_zero() {
+        let conn = db();
+        record_usage(&conn, 1, Some(7), TaskKind::Extract, None).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM llm_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }
