@@ -16,7 +16,7 @@ const names = computed(() => Object.fromEntries(props.nodes.map((node) => [node.
     <ol>
       <li v-for="event in events" :key="event.key" :style="{ '--event-source': `var(${provenanceTokens[event.provenance]})` }" :class="{ selected: selection.selection?.kind === 'event' && selection.selection.key === event.key }">
         <button class="event-title" @click="selection.selectEvent(event)">{{ event.title }}</button>
-        <small>第 {{ event.chapter_idx }} 章 · 顺序 {{ event.order }} · {{ provenanceLabels[event.provenance] }}</small>
+        <small>第 {{ event.chapter_idx }} 章 · 顺序 {{ event.order }}<template v-if="event.time"> · {{ event.time }}</template> · {{ provenanceLabels[event.provenance] }}</small>
         <p v-if="event.summary">{{ event.summary }}</p>
         <p v-if="event.participants.length" class="participants">{{ event.participants.map(key => names[key] ?? '未公开实体').join('、') }}</p>
         <button v-if="canJump" type="button" class="jump" @click="emit('jump', event.chapter_idx)">阅读此章</button>

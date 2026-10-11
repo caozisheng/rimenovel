@@ -20,6 +20,11 @@ impl CallControl {
     pub fn with_observer(mut self, observer: CallObserver) -> Self { self.observer = Some(observer); self }
     pub fn cancel(&self) { let _guard = self.commit_gate.lock(); self.cancellation.cancel(); }
     pub fn check(&self) -> Result<(), LlmError> { if self.cancellation.is_cancelled() { Err(LlmError::Cancelled) } else { Ok(()) } }
+    pub fn commit_guard(&self) -> Result<CommitGuard<'_>, LlmError> {
+        let guard = self.commit_gate.lock();
+        self.check()?;
+        Ok(guard)
+    }
     fn observe(&self, phase: &str, attempt: u32, delay: Option<Duration>) {
         if let Some(observer) = &self.observer { observer(CallObservation { phase: phase.into(), attempt, retry_after_ms: delay.map(|value| value.as_millis().min(u64::MAX as u128) as u64) }); }
     }
@@ -90,7 +95,18 @@ impl PolicyClient {
 impl LlmClient for PolicyClient {
     async fn structured_with_usage(&self, req: StructuredRequest<'_>) -> Result<StructuredResponse, LlmError> {
         if req.max_tokens == 0 { return Err(LlmError::Config("输出预算必须大于零".into())); }
-        let phase = match req.schema_name { "kg_stage_a" => "stage_a", "kg_stage_b" => "stage_b", "kg_identity" => "identity", "kg_adjudication" => "adjudication", "kg_spec" => "reconcile", "kg_reduce" => "reduce", _ => "request" };
+        if req.schema_name == "kg_chapter" {
+            self.control.check()?;
+            self.control.observe("extract", 1, None);
+            let result = tokio::select! {
+                biased;
+                _ = self.control.cancellation.cancelled() => Err(LlmError::Cancelled),
+                result = tokio::time::timeout(crate::core::kg_extract::REQUEST_TIMEOUT, self.inner.structured_with_usage(req)) => result.unwrap_or(Err(LlmError::Timeout)),
+            };
+            self.control.check()?;
+            return result.map_err(|error| self.sanitize(error));
+        }
+        let phase = if req.schema_name == "kg_working" { "reconcile" } else { "request" };
         self.run(phase, || self.inner.structured_with_usage(req.clone()), &AtomicBool::new(false)).await
     }
     async fn stream_text(&self, req: TextRequest, on_delta: Arc<dyn for<'a> Fn(&'a str) + Send + Sync>) -> Result<String, LlmError> {
@@ -105,9 +121,7 @@ impl LlmClient for PolicyClient {
     }
     fn check_cancelled(&self) -> Result<(), LlmError> { self.control.check() }
     fn commit_guard(&self) -> Result<Option<CommitGuard<'_>>, LlmError> {
-        let guard = self.control.commit_gate.lock();
-        self.control.check()?;
-        Ok(Some(guard))
+        self.control.commit_guard().map(Some)
     }
 }
 
@@ -132,6 +146,15 @@ mod tests {
         }
     }
     fn request(schema:&serde_json::Value)->StructuredRequest<'_> { StructuredRequest {task:super::super::TaskKind::Extract,messages:vec![],schema,schema_name:"test",temperature:0.0,max_tokens:128} }
+    #[tokio::test]
+    async fn compact_extraction_never_spends_quota_on_automatic_retries() {
+        let attempts=Arc::new(AtomicUsize::new(0));
+        let client=PolicyClient::new(Box::new(Scripted {attempts:attempts.clone(),status:503,emit:false}),CallControl::default());
+        let schema=json!({"type":"object"});
+        let mut req=request(&schema);req.schema_name="kg_chapter";
+        assert!(matches!(client.structured_with_usage(req).await,Err(LlmError::Server {status:503,..})));
+        assert_eq!(attempts.load(Ordering::SeqCst),1);
+    }
     #[tokio::test]
     async fn server_errors_are_bounded_and_auth_is_not_retried() {
         for (status,expected) in [(503,3),(504,3),(429,3),(401,1),(400,1)] {

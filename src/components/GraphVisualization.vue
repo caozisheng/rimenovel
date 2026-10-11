@@ -39,7 +39,6 @@ const selectedTitle = computed(() => {
   if ("title" in element) return element.title;
   return element.rel_type;
 });
-const statusLabels: Record<GraphEdge["status"], string> = { active: "有效", broken: "破裂", former: "曾经", unknown: "未知" };
 const entityLabels = Object.fromEntries(entityTypes.map((type) => [type.value, type.label]));
 
 watch(selected, (element) => {
@@ -110,20 +109,21 @@ onBeforeUnmount(() => selection.clear());
               <dt>实体类型</dt><dd>{{ entityLabels[selected.type] }}</dd>
               <dt>别名</dt><dd>{{ selected.aliases.join('、') || '无' }}</dd>
               <dt>摘要</dt><dd>{{ selected.summary || '无' }}</dd>
+              <dt v-if="selected.type === 'character'">生命状态</dt><dd v-if="selected.type === 'character'">{{ selected.life_status === 'alive' ? '生存' : selected.life_status === 'dead' ? '死亡' : '未知' }}</dd>
+              <dt>所在地</dt><dd>{{ selected.location ? names[selected.location] ?? '未公开实体' : '无' }}</dd>
+              <dt v-if="selected.type === 'item'">所有者</dt><dd v-if="selected.type === 'item'">{{ selected.owner ? names[selected.owner] ?? '未公开实体' : '无' }}</dd>
             </template>
             <template v-else-if="'src' in selected">
               <dt>起点</dt><dd>{{ names[selected.src] ?? '未公开实体' }}</dd>
               <dt>终点</dt><dd>{{ names[selected.dst] ?? '未公开实体' }}</dd>
-              <dt>状态</dt><dd>{{ statusLabels[selected.status] }}</dd>
-              <dt>开始章节</dt><dd>{{ selected.since_chapter }}</dd>
               <dt>关系说明</dt><dd>{{ selected.description || '无' }}</dd>
             </template>
             <template v-else>
               <dt>章内顺序</dt><dd>{{ selected.order }}</dd>
               <dt>参与者</dt><dd>{{ selected.participants.map(key => names[key] ?? '未公开实体').join('、') || '无' }}</dd>
               <dt>地点</dt><dd>{{ selected.location ? names[selected.location] ?? '未公开实体' : '无' }}</dd>
+              <dt>时间</dt><dd>{{ selected.time || '无' }}</dd>
               <dt>摘要</dt><dd>{{ selected.summary || '无' }}</dd>
-              <dt>{{ purpose === 'spec' || selected.provenance === 'user' ? '预期结果' : '文本结果' }}</dt><dd>{{ selected.outcome || '无' }}</dd>
             </template>
           </dl>
           <button v-if="canJump && 'participants' in selected" type="button" @click="emit('jump', selected.chapter_idx)">阅读此章</button>

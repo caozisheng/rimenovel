@@ -8,15 +8,14 @@ const ipc = vi.hoisted(() => ({
   jobCallback: null as (() => void) | null,
 }));
 vi.mock("../lib/kg", () => ({
-  getGraph: async () => ({ nodes: [], edges: [], events: [], ready: false, reader_progress: 1, revealed: false }),
+  getGraph: async () => ({ nodes: [], edges: [], events: [], purpose: "actual", ready: false, reader_progress: 1, chapter_idx: 1, fog: null, revealed: false, summary: "", open_threads: [], coverage: { mode: "partial", total_chapters: 3, selected_chapters: [1], completed_chapters: [], missing_chapters: [1, 2, 3], legacy_chapters: [], calls_used: 0, elapsed_ms: 0, target_complete: false }, revision: null, drift_score: null, reading_line_version: 1, divergence_idx: null }),
   listGraphEdits: async () => [],
   getExtractionStatuses: async () => ipc.statuses,
   startBookExtraction: async () => { ipc.statuses = [{ book_id: 1, job_id: 12, kind: "global_extract", state: "queued", progress: 0, error: null }]; return 12; },
-  cancelBookJobs: vi.fn(),
+  extractChapterGraph: vi.fn(), cancelBookJobs: vi.fn(),
   onKgEvent: async (name: string, _parser: unknown, callback: (event: unknown) => void) => { if (name === "job:progress") ipc.jobCallback = () => callback({ book_id: 1 }); return () => {}; },
-  parseJobStatus: (value: unknown) => value,
-  parseGraphChanged: (value: unknown) => value,
-  applyGraphEdit: vi.fn(), getGraphEvidence: vi.fn(), revealGraph: vi.fn(), revertGraphEdit: vi.fn(),
+  parseJobStatus: (value: unknown) => value, parseGraphChanged: (value: unknown) => value,
+  applyGraphEdit: vi.fn(), revealGraph: vi.fn(), revertGraphEdit: vi.fn(),
 }));
 const mounted: VueWrapper[] = [];
 function render() {
@@ -34,7 +33,7 @@ describe("workbench background extraction feedback", () => {
     await flushPromises();
     expect(wrapper.text()).toContain("HTTP 504: gateway timeout");
     expect(wrapper.text()).toContain("第 1 章");
-    const retry = wrapper.findAll("button").find(button => button.text() === "重试抽取");
+    const retry = wrapper.findAll("button").find(button => button.text() === "重试样本抽取");
     expect(retry).toBeDefined();
     await retry!.trigger("click");
     await flushPromises();

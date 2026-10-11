@@ -71,6 +71,39 @@ async fn mount_stream(server: &MockServer, sse: &str) {
 }
 
 
+// This service boundary reproduces the real gateway's strict-schema rejection,
+// rather than accepting every request as a successful buffered fixture.
+fn supported_typed_schema(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("const") { return false; }
+            if object.get("enum").and_then(Value::as_array).is_some_and(|values| values.iter().all(Value::is_string))
+                && object.get("type").and_then(Value::as_str) != Some("string") { return false; }
+            object.values().all(supported_typed_schema)
+        },
+        Value::Array(values) => values.iter().all(supported_typed_schema),
+        _ => true,
+    }
+}
+
+#[tokio::test]
+async fn compact_graph_works_with_provider_requiring_typed_scalar_constraints() {
+    let shape = crate::core::kg_extract::graph_schema().clone();
+    let value = json!({"summary":"本章交代旅途背景","entities":[],"relations":[],"events":[],"open_threads":[]});
+    let server = MockServer::start().await;
+    let reply = format!("data: {}\n\ndata: [DONE]\n\n", completion(&value.to_string()));
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let valid = supported_typed_schema(body.pointer("/response_format/json_schema/schema").unwrap());
+            ResponseTemplate::new(200).insert_header("content-type","text/event-stream")
+                .set_body_string(if valid { reply.clone() } else {
+                    "data: {\"error\":{\"code\":\"bad_response\",\"message\":\"responses stream error: response.failed\",\"type\":\"bad_response\"}}\n\n".into()
+                })
+        }).expect(1).mount(&server).await;
+    assert_eq!(client(server.uri()).structured(request(&shape)).await.unwrap(), value);
+}
+
 #[tokio::test]
 async fn structured_preserves_reported_usage() {
     let server = MockServer::start().await;

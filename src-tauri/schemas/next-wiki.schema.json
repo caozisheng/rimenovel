@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rimenovel.local/schemas/next-wiki.schema.json",
+  "title": "next_wiki",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["chapter_idx", "goals", "state_directions", "open_threads", "avoid", "ending_direction", "related_entry_ids"],
+  "properties": {
+    "chapter_idx": {"type": "integer", "minimum": 1},
+    "goals": {"type": "array", "items": {"type": "string"}},
+    "state_directions": {"type": "array", "items": {"type": "string"}},
+    "open_threads": {"type": "array", "items": {"type": "string"}},
+    "avoid": {"type": "array", "items": {"type": "string"}},
+    "ending_direction": {"type": "string"},
+    "related_entry_ids": {"type": "array", "items": {"type": "string"}}
+  }
+}

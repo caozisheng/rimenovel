@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rimenovel.local/schemas/question-batch.schema.json",
+  "title": "question_batch",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["batch_index", "question_batch_id", "questions"],
+  "properties": {
+    "batch_index": {"type": "integer", "minimum": 0},
+    "question_batch_id": {"type": "string", "minLength": 1},
+    "questions": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/question"}}
+  },
+  "$defs": {
+    "question": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "prompt", "options"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "prompt": {"type": "string", "minLength": 1},
+        "options": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/option"}}
+      }
+    },
+    "option": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "label"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

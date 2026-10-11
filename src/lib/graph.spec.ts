@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { filterGraph, sortEvents, eventNodeKeys, type GraphData, type GraphEvent } from "./graph";
 import { useGraphSelectionStore } from "./graphSelection";
 
-const event = (key: string, chapter_idx: number, order: number): GraphEvent => ({ key, chapter_idx, order, title: key, participants: ["person", "person"], location: "place", summary: "", outcome: "", provenance: "user" });
+const event = (key: string, chapter_idx: number, order: number): GraphEvent => ({ key, chapter_idx, order, title: key, participants: ["person", "person"], location: "place", time: null, summary: "", provenance: "user" });
 
 describe("graph presentation", () => {
   it("sorts timeline by chapter then order without mutating the input", () => {
@@ -14,10 +14,10 @@ describe("graph presentation", () => {
   it("filters entity types and removes relations with hidden endpoints", () => {
     const graph: GraphData = {
       nodes: [
-        { key: "person", type: "character", name: "人物", aliases: [], summary: null, chapter_idx: 1, provenance: "user" },
-        { key: "place", type: "location", name: "地点", aliases: [], summary: null, chapter_idx: 1, provenance: "user" },
+        { key: "person", type: "character", name: "人物", aliases: [], summary: null, life_status: "alive", location: "place", owner: null, chapter_idx: 1, provenance: "user" },
+        { key: "place", type: "location", name: "地点", aliases: [], summary: null, life_status: null, location: null, owner: null, chapter_idx: 1, provenance: "user" },
       ],
-      edges: [{ key: "edge", src: "person", dst: "place", rel_type: "位于", description: null, status: "active", since_chapter: 1, chapter_idx: 1, provenance: "user" }],
+      edges: [{ key: "edge", src: "person", dst: "place", rel_type: "位于", description: null, chapter_idx: 1, provenance: "user" }],
       events: [],
     };
     const result = filterGraph(graph, ["character"]);

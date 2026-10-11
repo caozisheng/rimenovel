@@ -1,5 +1,5 @@
 // LLM Provider 层（dev-plan Task 3.1）
-// 任务路由三类: extract(窗口/章节抽取/回抽/消歧) merge(合并裁决/前向调和) write(正文生成)
+// 任务档位：extract（轻量章节图谱/回抽）、merge（下一章工作图谱）、write（流式正文）。
 pub mod anthropic;
 pub mod cache;
 pub mod openai;

@@ -68,15 +68,13 @@ pub fn run() {
             commands::providers::provider_delete,
             commands::providers::provider_test,
             commands::status::get_extraction_statuses,
-            commands::kg::get_graph,
-            commands::kg::get_graph_evidence,
-            commands::kg::reveal_graph,
-            commands::kg::apply_graph_edit,
-            commands::kg::revert_graph_edit,
-            commands::kg::list_graph_edits,
             commands::kg::start_book_extraction,
-            commands::kg::cancel_book_jobs,
-            commands::kg::extract_chapter_graph
+            commands::story::get_story_map,
+            commands::story::save_intervention,
+            commands::story::end_questionnaire,
+            commands::story::get_active_interventions,
+            commands::story::get_question_batch,
+            commands::story::get_next_wiki
         ])
         .run(tauri::generate_context!())
         .expect("error while running rimenovel application");

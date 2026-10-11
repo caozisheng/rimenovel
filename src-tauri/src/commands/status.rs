@@ -16,10 +16,11 @@ pub struct ExtractionStatus {
     pub retry_after_ms: Option<u64>,
     pub state: String, // queued|running|paused|done|failed|cancelled|none
     pub progress: f64,
+    pub coverage: Option<crate::core::kg::GraphCoverage>,
 }
 
 /// Per-book background status: unfinished work first, otherwise the latest result.
-pub fn extraction_statuses(conn: &Connection) -> rusqlite::Result<Vec<ExtractionStatus>> {
+pub fn extraction_statuses(conn: &Connection) -> Result<Vec<ExtractionStatus>, String> {
     let mut stmt = conn.prepare(
         "SELECT book_id, state, progress, id, kind,
                 json_extract(payload_json, '$.chapter_idx'), error,
@@ -33,7 +34,7 @@ pub fn extraction_statuses(conn: &Connection) -> rusqlite::Result<Vec<Extraction
              ) AS priority
              FROM jobs WHERE kind IN ('global_extract','chapter_extract','generate','reconcile')
          ) WHERE priority = 1",
-    )?;
+    ).map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |r| {
         Ok(ExtractionStatus {
             book_id: r.get(0)?,
@@ -46,9 +47,15 @@ pub fn extraction_statuses(conn: &Connection) -> rusqlite::Result<Vec<Extraction
             phase: r.get(7)?,
             attempt: r.get(8)?,
             retry_after_ms: r.get(9)?,
+            coverage: None,
         })
-    })?;
-    rows.collect()
+    }).map_err(|e| e.to_string())?;
+    let mut statuses = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    for status in &mut statuses {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM books WHERE id=?1)", [status.book_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if exists { status.coverage = Some(crate::store::kg::coverage(conn, status.book_id)?); }
+    }
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -57,12 +64,37 @@ pub fn get_extraction_statuses(
 ) -> Result<Vec<ExtractionStatus>, String> {
     let guard = state.db.lock();
     let conn = guard.as_ref().ok_or("数据库未初始化")?;
-    extraction_statuses(conn).map_err(|e| e.to_string())
+    extraction_statuses(conn)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_sample_status_does_not_claim_full_book_coverage() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        let chapters: Vec<_> = (1..=100).map(|idx| crate::store::books::NewChapter { idx, title: format!("Chapter {idx}"), text: format!("Prose {idx}"), token_est: 10 }).collect();
+        let book = crate::store::books::create_book_with_chapters(&conn, "Sampled", None, "txt", "test", &chapters).unwrap();
+        let config = crate::core::kg::RuntimeConfig { provider_id: 1, model_extract: "test".into(), context_limit: 32768, output_reserve: 4096, prompt_version: "kg-lite/v1".into() };
+        crate::store::kg::set_extraction_plan(&conn, book, &[1, 100], 2, 300).unwrap();
+        for idx in [1, 100] {
+            let text = crate::store::kg::text_version(&conn, book, idx, "original", None).unwrap();
+            crate::store::kg::commit_snapshot(&conn, &text, &crate::core::kg::ChapterSnapshot { summary: format!("Sample {idx}"), ..Default::default() }, "test", 0, None, &config).unwrap();
+        }
+        let id = crate::jobs::enqueue(&conn, book, crate::jobs::JobKind::GlobalExtract, serde_json::json!({"graph_format":"kg-lite/v1"})).unwrap();
+        crate::jobs::mark_done(&conn, id).unwrap();
+        let status = extraction_statuses(&conn).unwrap().remove(0);
+        assert_eq!(status.state, "done");
+        let coverage = status.coverage.unwrap();
+        assert_eq!(coverage.mode, "sampled");
+        assert!(coverage.target_complete);
+        assert_eq!(coverage.total_chapters, 100);
+        assert_eq!(coverage.completed_chapters, vec![1, 100]);
+        assert_eq!(coverage.missing_chapters.len(), 98);
+        assert_eq!(coverage.calls_used, 2);
+    }
 
     #[test]
     fn blocked_successor_surfaces_predecessor_error_without_active_orphan() {
@@ -199,15 +231,15 @@ mod tests {
     }
 
     #[test]
-    fn running_stage_is_visible_even_when_prefetch_successor_is_queued() {
+    fn running_extraction_is_visible_even_when_prefetch_successor_is_queued() {
         let conn = Connection::open_in_memory().unwrap();
         crate::store::Db::new(&conn).migrate().unwrap();
-        conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json) VALUES(1,'global_extract','running',0.25,'{\"phase\":\"stage_b\",\"attempt\":2}')", []).unwrap();
+        conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json) VALUES(1,'global_extract','running',0.25,'{\"phase\":\"chapter\",\"attempt\":1}')", []).unwrap();
         conn.execute("INSERT INTO jobs(book_id,kind,state,progress,payload_json) VALUES(1,'chapter_extract','queued',0,'{\"phase\":\"queued\",\"chapter_idx\":2}')", []).unwrap();
         let statuses = extraction_statuses(&conn).unwrap();
         let status = &statuses[0];
         assert_eq!(status.state, "running");
-        assert_eq!(status.phase.as_deref(), Some("stage_b"));
-        assert_eq!(status.attempt, Some(2));
+        assert_eq!(status.phase.as_deref(), Some("chapter"));
+        assert_eq!(status.attempt, Some(1));
     }
 }

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kg_chapter", "type": "object", "additionalProperties": false,
+  "required": ["summary", "entities", "relations", "events", "open_threads"],
+  "properties": {
+    "summary": {"type":"string","minLength":1,"maxLength":240},
+    "entities": {"type":"array","items":{"$ref":"#/$defs/entity"}},
+    "relations": {"type":"array","items":{"$ref":"#/$defs/relation"}},
+    "events": {"type":"array","items":{"$ref":"#/$defs/event"}},
+    "open_threads": {"type":"array","maxItems":5,"items":{"type":"string","minLength":1,"maxLength":160}}
+  },
+  "$defs": {
+    "reference": {"type":"string","minLength":1},
+    "nullable_reference": {"type":["string","null"]},
+    "entity": {
+      "type":"object","additionalProperties":false,
+      "required":["ref","type","name","aliases","description","life_status","location","owner"],
+      "properties": {
+        "ref":{"$ref":"#/$defs/reference"},
+        "type":{"type":"string","enum":["character","location","item","faction"]},
+        "name":{"type":"string","minLength":1,"maxLength":80},
+        "aliases":{"type":"array","maxItems":4,"items":{"type":"string","minLength":1,"maxLength":80}},
+        "description":{"type":"string","maxLength":160},
+        "life_status":{"type":["string","null"],"enum":["alive","dead",null]},
+        "location":{"$ref":"#/$defs/nullable_reference"},
+        "owner":{"$ref":"#/$defs/nullable_reference"}
+      }
+    },
+    "relation": {
+      "type":"object","additionalProperties":false,
+      "required":["from","to","label","description"],
+      "properties": {
+        "from":{"$ref":"#/$defs/reference"},"to":{"$ref":"#/$defs/reference"},
+        "label":{"type":"string","minLength":1,"maxLength":40},
+        "description":{"type":["string","null"],"maxLength":160}
+      }
+    },
+    "event": {
+      "type":"object","additionalProperties":false,
+      "required":["title","participants","location","time","summary"],
+      "properties": {
+        "title":{"type":"string","minLength":1,"maxLength":80},
+        "participants":{"type":"array","items":{"$ref":"#/$defs/reference"}},
+        "location":{"$ref":"#/$defs/nullable_reference"},
+        "time":{"type":["string","null"],"maxLength":80},
+        "summary":{"type":"string","maxLength":240}
+      }
+    }
+  }
+}

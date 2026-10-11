@@ -2,266 +2,118 @@ use super::*;
 use crate::store::{books::{create_book_with_chapters, NewChapter}, Db};
 
 fn fixture() -> (Connection, i64) {
-    let conn = Connection::open_in_memory().unwrap();
-    Db::apply_pragmas(&conn).unwrap();
-    Db::new(&conn).migrate().unwrap();
-    let chapters = (1..=4).map(|idx| NewChapter { idx, title: format!("Chapter {idx}"), text: "甲在城中。乙仍活着。".into(), token_est: 20 }).collect::<Vec<_>>();
-    let book = create_book_with_chapters(&conn, "test", None, "txt", "test", &chapters).unwrap();
-    (conn, book)
+    let conn=Connection::open_in_memory().unwrap(); Db::apply_pragmas(&conn).unwrap(); Db::new(&conn).migrate().unwrap();
+    let chapters=(1..=4).map(|idx|NewChapter{idx,title:format!("Chapter {idx}"),text:"甲在城中。乙仍活着。".into(),token_est:20}).collect::<Vec<_>>();
+    let book=create_book_with_chapters(&conn,"test",None,"txt","test",&chapters).unwrap(); (conn,book)
 }
-fn bundle(idx: i64) -> ChapterBundle {
-    ChapterBundle {
-        stage_a: StageA { schema_version: "kg-stage-a/v1".into(), chapter_idx: idx, summary: String::new(), open_threads: vec![], mentions: vec![], events: vec![] },
-        stage_b: StageB { schema_version: "kg-stage-b/v1".into(), chapter_idx: idx, facts: vec![Fact { key: "name".into(), subject_key: "future-real-name".into(), predicate: "name".into(), value: TypedValue { kind: "scalar".into(), value: Some("甲".into()) }, chapter_idx: idx, observed_chapter: idx, observed_order: 0, temporal_scope: "current".into(), assertion_kind: "confirmed".into(), speaker_key: None, evidence_refs: vec!["s".into()] }], relations: vec![], changes: vec![], preconditions:vec![], unresolved: vec![] },
-        identities: vec![Identity { key: "future-real-name".into(), entity_type: "character".into(), name: "未来真名".into(), aliases: vec!["未来别名".into()] }],
-        spans: vec![Span { key: "s".into(), chapter_idx: idx, start_byte: 0, end_byte: 3, text: "甲".into() }], identity_links: vec![],
-    }
-}
-fn query(book: i64, purpose: &str, idx: i64) -> GraphQuery { GraphQuery { book_id: book, scope: "global".into(), purpose: purpose.into(), chapter_idx: Some(idx) } }
+fn config()->RuntimeConfig { RuntimeConfig{provider_id:1,model_extract:"model".into(),context_limit:32768,output_reserve:4096,prompt_version:"kg-lite/v1".into()} }
+fn snapshot(idx:i64)->ChapterSnapshot { ChapterSnapshot{summary:format!("chapter {idx}"),nodes:vec![GraphNode{key:"hero".into(),entity_type:"character".into(),name:"甲".into(),aliases:vec![],summary:None,life_status:Some("alive".into()),location:None,owner:None,chapter_idx:idx,provenance:"ai_original".into()}],edges:vec![],events:vec![],open_threads:vec![format!("thread {idx}")]} }
+fn query(book:i64,purpose:&str,idx:i64)->GraphQuery {GraphQuery{book_id:book,scope:"global".into(),purpose:purpose.into(),chapter_idx:Some(idx)}}
+fn commit(conn:&Connection,book:i64,idx:i64)->i64 {let text=text_version(conn,book,idx,"original",None).unwrap();commit_snapshot(conn,&text,&snapshot(idx),"dep",line_version(conn,book).unwrap(),None,&config()).unwrap()}
 #[test]
-fn legacy_ai_projection_is_archived_without_becoming_fact_truth() {
-    let conn=Connection::open_in_memory().unwrap();Db::apply_pragmas(&conn).unwrap();
-    conn.execute_batch(include_str!("../../../../migrations/0001_init.sql")).unwrap();
-    let id=crate::store::books::create_book_with_chapters(&conn,"legacy",None,"txt","legacy",&[NewChapter{idx:1,title:"one".into(),text:"text".into(),token_est:1}]).unwrap();
-    conn.execute("INSERT INTO graph_nodes(book_id,scope,key,type,name,aliases_json,provenance) VALUES (?1,'global','old','character','old','[]','ai_original')",[id]).unwrap();
-    Db::new(&conn).migrate().unwrap();
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM graph_nodes WHERE book_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
-    assert_eq!(conn.query_row("SELECT reason FROM kg_legacy_archive WHERE book_id=?1",[id],|r|r.get::<_,String>(0)).unwrap(),"needs-reextract");
-    assert_eq!(missing_original_chapters(&conn,id).unwrap(),vec![1]);
+fn sparse_reference_plan_is_complete_without_skipped_text_materialization() {
+    let (conn,book)=fixture();set_extraction_plan(&conn,book,&[1,4],2,100).unwrap();commit(&conn,book,1);commit(&conn,book,4);
+    let sampled=coverage(&conn,book).unwrap();assert_eq!(sampled.mode,"sampled");assert!(sampled.target_complete);assert_eq!(sampled.missing_chapters,vec![2,3]);
+    assert!(internal_view(&conn,&query(book,"reference",4)).unwrap().ready);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM kg_text_versions",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    set_extraction_plan(&conn,book,&[1,4],0,0).unwrap();record_extraction_attempt(&conn,book,3,200).unwrap();assert_eq!(coverage(&conn,book).unwrap().calls_used,3);
 }
 #[test]
-fn revision_replay_exact_missing_set_and_public_names() {
-    let (conn, book) = fixture();
-    let t = text_version(&conn, book, 2, "original", None).unwrap();
-    let a = commit_bundle(&conn, &t, &bundle(2), "d", 0, None).unwrap();
-    assert_eq!(a, commit_bundle(&conn, &t, &bundle(2), "d", 0, None).unwrap());
-    assert_eq!(missing_original_chapters(&conn, book).unwrap(), vec![1,3,4]);
-    mark_read(&conn, book, 2).unwrap();
-    let view = get_view(&conn, &query(book, "actual", 2)).unwrap();
-    assert_eq!(view.nodes[0].name, "甲");
-    let json = serde_json::to_string(&view).unwrap();
-    assert!(!json.contains("future-real-name"));
-    assert!(!json.contains("未来"));
+fn chapter_readiness_and_actual_gaps_do_not_claim_full_history() {
+    let (conn,book)=fixture();commit(&conn,book,4);mark_read(&conn,book,4).unwrap();
+    let mut q=query(book,"actual",4);q.scope="chapter".into();let chapter=internal_view(&conn,&q).unwrap();assert!(chapter.ready);assert_eq!(chapter.coverage.missing_chapters,vec![1,2,3]);
+    assert!(!internal_view(&conn,&query(book,"actual",4)).unwrap().ready);
 }
 #[test]
-fn failed_job_checkpoint_rolls_back_every_authoritative_record() {
-    let (conn, book) = fixture();
-    let t = text_version(&conn, book, 1, "original", None).unwrap();
-    assert!(commit_bundle(&conn, &t, &bundle(1), "d", 0, Some(999)).is_err());
-    assert!(!ready(&conn, t.id).unwrap());
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM kg_records", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
-}
-
-#[test]
-fn cancelled_job_cannot_publish_a_revision_or_checkpoint() {
-    let (conn, book) = fixture();
-    let text = text_version(&conn, book, 1, "original", None).unwrap();
-    let job = crate::jobs::enqueue(&conn, book, crate::jobs::JobKind::GlobalExtract, serde_json::json!({"phase":"stage_b","provider_id":1})).unwrap();
-    conn.execute("UPDATE jobs SET state='cancelled' WHERE id=?1", [job]).unwrap();
-    assert!(commit_bundle(&conn, &text, &bundle(1), "dependencies", 0, Some(job)).is_err());
-    assert!(!ready(&conn, text.id).unwrap());
-    let payload = job_checkpoint(&conn, job).unwrap();
-    assert!(payload.get("committed_revisions").is_none());
-    assert_eq!(payload["phase"], "stage_b");
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM kg_records", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
-}
-
-#[test]
-fn revision_checkpoint_preserves_live_call_observations() {
-    let (conn, book) = fixture();
-    let text = text_version(&conn, book, 1, "original", None).unwrap();
-    let job = crate::jobs::enqueue(&conn, book, crate::jobs::JobKind::GlobalExtract, serde_json::json!({"phase":"stage_b","attempt":2,"provider_id":3})).unwrap();
-    commit_bundle(&conn, &text, &bundle(1), "dependencies", 0, Some(job)).unwrap();
-    let payload = job_checkpoint(&conn, job).unwrap();
-    assert_eq!(payload["attempt"], 2);
-    assert_eq!(payload["provider_id"], 3);
-    assert_eq!(payload["phase"], "stage_b");
-    assert_eq!(payload["committed_revisions"]["1"]["text_version_id"], text.id);
+fn snapshot_state_folds_in_order_and_edit_undo_preserves_actual() {
+    let (conn,book)=fixture();commit(&conn,book,1);let text=text_version(&conn,book,2,"original",None).unwrap();let mut dead=snapshot(2);dead.nodes[0].life_status=Some("dead".into());commit_snapshot(&conn,&text,&dead,"dep",0,None,&config()).unwrap();mark_read(&conn,book,1).unwrap();
+    let key=get_view(&conn,&query(book,"actual",1)).unwrap().nodes[0].key.clone();
+    let input=EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some(key),action:"upsert".into(),data:serde_json::json!({"life_status":"alive","location":null})};let id=edit(&conn,&input).unwrap();
+    assert_eq!(internal_view(&conn,&query(book,"spec",2)).unwrap().nodes[0].life_status.as_deref(),Some("alive"));
+    assert_eq!(internal_view(&conn,&query(book,"actual",2)).unwrap().nodes[0].life_status.as_deref(),Some("alive"));assert_eq!(internal_view(&conn,&query(book,"reference",2)).unwrap().nodes[0].life_status.as_deref(),Some("dead"));revert(&conn,book,id).unwrap();assert_eq!(internal_view(&conn,&query(book,"spec",2)).unwrap().nodes[0].life_status.as_deref(),Some("dead"));
 }
 #[test]
-fn future_intent_never_mutates_actual_and_revert_restores_digest() {
-    let (conn, book) = fixture();
-    let t = text_version(&conn, book, 1, "original", None).unwrap();
-    commit_bundle(&conn, &t, &bundle(1), "d", 0, None).unwrap();
-    mark_read(&conn, book, 1).unwrap();
-    let before = generation_context(&conn, book, 2).unwrap();
-    let key = get_view(&conn, &query(book,"actual",1)).unwrap().nodes[0].key.clone();
-    let edit_id = edit(&conn, &EditInput { book_id: book, scope: "global".into(), chapter_idx: None, kind: "node".into(), action: "upsert".into(), key: Some(key), data: serde_json::json!({"name":"新名字"}) }).unwrap();
-    assert_eq!(get_view(&conn, &query(book,"actual",1)).unwrap().nodes[0].name, "甲");
-    assert_ne!(generation_context(&conn,book,2).unwrap().digest, before.digest);
-    revert(&conn, book, edit_id).unwrap();
-    assert_eq!(generation_context(&conn,book,2).unwrap().digest, before.digest);
+fn hidden_future_redacts_summary_threads_and_state_references() {
+    let (conn,book)=fixture();commit(&conn,book,1);commit(&conn,book,2);mark_read(&conn,book,1).unwrap();let hidden=get_view(&conn,&query(book,"spec",2)).unwrap();assert!(hidden.summary.is_empty());assert!(hidden.open_threads.is_empty());assert!(hidden.nodes.is_empty());reveal(&conn,book,2).unwrap();assert_eq!(get_view(&conn,&query(book,"spec",2)).unwrap().summary,"chapter 1\nchapter 2");
 }
 #[test]
-fn hidden_spec_reveal_is_target_only_and_evidence_authorized() {
-    let (conn, book) = fixture();
-    for idx in 1..=4 { let t = text_version(&conn,book,idx,"original",None).unwrap(); commit_bundle(&conn,&t,&bundle(idx),"d",0,None).unwrap(); }
-    mark_read(&conn,book,1).unwrap();
-    let hidden = get_view(&conn,&query(book,"spec",2)).unwrap();
-    assert!(hidden.nodes.is_empty());
-    assert!(hidden.fog.is_some());
-    assert!(reveal(&conn,book,3).is_err());
-    reveal(&conn,book,2).unwrap();
-    let revealed = get_view(&conn,&query(book,"spec",2)).unwrap();
-    assert!(!revealed.nodes.is_empty());
-    assert!(get_view(&conn,&query(book,"reference",4)).unwrap().nodes.iter().all(|n| n.chapter_idx <= 1));
-    assert!(evidence(&conn,&query(book,"actual",1),"node","n-hidden").is_err());
+fn cancelled_or_stale_result_cannot_publish_or_checkpoint() {
+    let (conn,book)=fixture();let text=text_version(&conn,book,1,"original",None).unwrap();conn.execute("INSERT INTO jobs(book_id,kind,state,payload_json) VALUES (?1,'global_extract','cancelled','{}')",[book]).unwrap();let job=conn.last_insert_rowid();
+    assert!(commit_snapshot(&conn,&text,&snapshot(1),"dep",0,Some(job),&config()).is_err());assert!(!ready(&conn,text.id).unwrap());assert_eq!(job_checkpoint(&conn,job).unwrap(),serde_json::json!({}));
+    conn.execute("UPDATE kg_lines SET version=1 WHERE book_id=?1",[book]).unwrap();assert!(commit_snapshot(&conn,&text,&snapshot(1),"dep",0,None,&config()).is_err());
 }
 #[test]
-fn immutable_versions_and_stale_generated_commits_are_rejected() {
-    let (conn,book) = fixture();
-    let original = text_version(&conn,book,1,"original",None).unwrap();
-    assert!(conn.execute("UPDATE kg_text_versions SET content='changed' WHERE id=?1",[original.id]).is_err());
-    mark_read(&conn,book,1).unwrap();
-    edit(&conn,&EditInput { book_id:book, scope:"global".into(), chapter_idx:None, kind:"directive".into(), action:"upsert".into(), key:None, data:serde_json::json!({"text":"继续"}) }).unwrap();
-    assert!(save_generated(&conn,book,2,"new","model","digest",0).is_err());
-    let generated = save_generated(&conn,book,2,"new","model","digest",1).unwrap();
-    let mut b = bundle(2); b.spans[0].text="n".into(); b.spans[0].end_byte=1;
-    edit(&conn,&EditInput { book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"change"}) }).unwrap();
-    assert!(commit_bundle(&conn,&generated,&b,"digest",1,None).is_err());
-    assert!(selected_text(&conn,book,2).unwrap().is_none());
-}
-
-#[test]
-fn reverting_prior_intent_reselects_original_for_read_generated_chapter() {
-    let (conn,book)=fixture();
-    let first=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&first,&bundle(1),"d",0,None).unwrap();
-    mark_read(&conn,book,1).unwrap();
-    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})}).unwrap();
-    let generated=save_generated(&conn,book,2,"generated text","m","dep",1).unwrap();let mut second=bundle(2);second.spans[0].text="generated".into();second.spans[0].end_byte=9;commit_bundle(&conn,&generated,&second,"dep",1,None).unwrap();mark_read(&conn,book,2).unwrap();
-    assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().source,"generated");
-    revert(&conn,book,1).unwrap();
-    assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().source,"original");
-    assert_eq!(progress(&conn,book).unwrap(),2);
-}
-
-#[test]
-fn identical_generated_bytes_have_separate_dependency_owned_versions() {
-    let (conn,book)=fixture();mark_read(&conn,book,1).unwrap();
-    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})}).unwrap();
-    let a=save_generated(&conn,book,2,"identical","m","dep-a",1).unwrap();
-    let b=save_generated(&conn,book,2,"identical","m","dep-b",1).unwrap();
-    assert_eq!(a.content_hash,b.content_hash);assert_ne!(a.id,b.id);assert_ne!(a.generated_id,b.generated_id);
-}
-
-#[test]
-fn independent_same_category_relations_preserve_intermediate_history() {
-    let (conn,book)=fixture();
-    for idx in 1..=3{
-        let mut b=bundle(idx);b.identities.push(Identity{key:"b".into(),entity_type:"character".into(),name:"乙".into(),aliases:vec![]});
-        b.spans.push(Span{key:"s2".into(),chapter_idx:idx,start_byte:15,end_byte:18,text:"乙".into()});
-        b.stage_b.facts.push(Fact{key:"b-name".into(),subject_key:"b".into(),predicate:"name".into(),value:TypedValue{kind:"scalar".into(),value:Some("乙".into())},chapter_idx:idx,observed_chapter:idx,observed_order:0,temporal_scope:"current".into(),assertion_kind:"confirmed".into(),speaker_key:None,evidence_refs:vec!["s2".into()]});
-        for key in ["family-a","family-b"]{b.stage_b.relations.push(RelationObservation{key:key.into(),src:"future-real-name".into(),dst:"b".into(),rel_category:"family".into(),rel_type:key.into(),status:if idx==2{"broken"}else{"active"}.into(),description:None,chapter_idx:idx,observed_chapter:idx,observed_order:1,temporal_scope:"current".into(),assertion_kind:"confirmed".into(),evidence_refs:vec!["s".into(),"s2".into()]});}
-        let t=text_version(&conn,book,idx,"original",None).unwrap();commit_bundle(&conn,&t,&b,"d",0,None).unwrap();
-    }
-    mark_read(&conn,book,3).unwrap();
-    for (idx,status) in [(1,"active"),(2,"broken"),(3,"active")]{let graph=get_view(&conn,&query(book,"actual",idx)).unwrap();assert_eq!(graph.edges.len(),2);assert!(graph.edges.iter().all(|e|e.status==status));assert_ne!(graph.edges[0].key,graph.edges[1].key);}
-}
-
-#[test]
-fn identity_links_are_revealed_only_at_evidenced_position() {
-    let (conn,book)=fixture();
-    let mut first=bundle(1);first.identities.push(Identity{key:"masked".into(),entity_type:"character".into(),name:"蒙面人".into(),aliases:vec![]});
-    let mut name=first.stage_b.facts[0].clone();name.key="mask-name".into();name.subject_key="masked".into();name.value.value=Some("蒙面人".into());first.stage_b.facts.push(name);
-    let t=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&t,&first,"d",0,None).unwrap();
-    let mut second=bundle(2);second.identity_links.push(IdentityLink{from_key:"masked".into(),to_key:"future-real-name".into(),observed_chapter:2,observed_order:1,evidence_refs:vec!["s".into()]});
-    let t=text_version(&conn,book,2,"original",None).unwrap();commit_bundle(&conn,&t,&second,"d",0,None).unwrap();mark_read(&conn,book,2).unwrap();
-    let early=get_view(&conn,&query(book,"actual",1)).unwrap();assert_eq!(early.nodes.len(),2);
-    let later=get_view(&conn,&query(book,"actual",2)).unwrap();assert_eq!(later.nodes.len(),1);
-    assert!(early.nodes.iter().all(|n|!n.key.contains("masked")&&!n.key.contains("future")));
-}
-
-#[test]
-fn foreign_identity_and_non_boundary_evidence_cannot_commit() {
-    let (conn,book)=fixture();let text=text_version(&conn,book,1,"original",None).unwrap();
-    let mut invalid=bundle(1);invalid.spans[0].end_byte=1;assert!(commit_bundle(&conn,&text,&invalid,"d",0,None).is_err());
-    let mut invalid=bundle(1);invalid.stage_b.facts[0].subject_key="other-book-only".into();assert!(commit_bundle(&conn,&text,&invalid,"d",0,None).is_err());
-    assert!(!ready(&conn,text.id).unwrap());
-}
-
-fn config()->RuntimeConfig{RuntimeConfig{provider_id:1,model_extract:"model".into(),context_limit:32768,output_reserve:4096,prompt_version:"test-1".into()}}
-#[test]
-fn refinement_invalidates_exact_descendant_and_cache_matches_prior_content() {
-    let (conn,book)=fixture();let cfg=config();
-    for idx in 1..=3{let t=text_version(&conn,book,idx,"original",None).unwrap();commit_bundle_with_config(&conn,&t,&bundle(idx),"d",0,None,&cfg).unwrap();}
-    let second=text_version(&conn,book,2,"original",None).unwrap();assert!(extraction_matches(&conn,second.id,&cfg).unwrap());
-    let first=text_version(&conn,book,1,"original",None).unwrap();let mut improved=bundle(1);improved.stage_a.summary="refined".into();commit_bundle_with_config(&conn,&first,&improved,"d2",0,None,&cfg).unwrap();
-    assert!(!extraction_matches(&conn,second.id,&cfg).unwrap());assert_eq!(missing_original_chapters(&conn,book).unwrap(),vec![2,3,4]);
+fn adding_original_sample_does_not_invalidate_existing_cache() {
+    let (conn,book)=fixture();commit(&conn,book,4);let text=text_version(&conn,book,4,"original",None).unwrap();commit(&conn,book,1);assert!(extraction_matches(&conn,text.id,&config()).unwrap());let mut changed=config();changed.model_extract="other".into();assert!(!extraction_matches(&conn,text.id,&changed).unwrap());
 }
 #[test]
-fn cached_prose_activation_reuses_only_compatible_same_text_revision() {
-    let (conn,book)=fixture();let cfg=config();let first=text_version(&conn,book,1,"original",None).unwrap();commit_bundle_with_config(&conn,&first,&bundle(1),"d",0,None,&cfg).unwrap();mark_read(&conn,book,1).unwrap();
-    let directive=EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})};
-    let edit_id=edit(&conn,&directive).unwrap();let generated=save_generated(&conn,book,2,"generated text","m","dep",1).unwrap();let mut b=bundle(2);b.spans[0].text="generated".into();b.spans[0].end_byte=9;commit_bundle_with_config(&conn,&generated,&b,"extract-dep",1,None,&cfg).unwrap();
-    revert(&conn,book,edit_id).unwrap();edit(&conn,&directive).unwrap();
-    assert!(activate_cached_for_config(&conn,generated.id,"wrong",3,&cfg).is_err());
-    activate_cached_for_config(&conn,generated.id,"dep",3,&cfg).unwrap();assert!(ready(&conn,generated.id).unwrap());
-    let mut changed=cfg.clone();changed.prompt_version="new".into();activate_cached_for_config(&conn,generated.id,"dep",3,&changed).unwrap();assert!(!ready(&conn,generated.id).unwrap());
+fn sparse_generation_context_keeps_prose_without_graph_backfill() {
+    let (conn,book)=fixture();commit(&conn,book,1);mark_read(&conn,book,3).unwrap();let context=generation_context(&conn,book,4).unwrap();assert_eq!(context.previous_text,"甲在城中。乙仍活着。");assert_eq!(context.actual.coverage.missing_chapters,vec![2,3]);
+    assert_eq!(conn.query_row("SELECT count(*) FROM kg_text_versions",[],|r|r.get::<_,i64>(0)).unwrap(),3);assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM kg_text_versions WHERE book_id=?1 AND chapter_idx=2)",[book],|r|r.get::<_,bool>(0)).unwrap());
 }
-
 #[test]
-fn adapted_preconditions_persist_with_spec_and_never_promote_to_actual() {
-    let (conn,book)=fixture();let first=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&first,&bundle(1),"d",0,None).unwrap();mark_read(&conn,book,1).unwrap();
-    let mut spec=internal_view(&conn,&GraphQuery{book_id:book,scope:"chapter".into(),purpose:"spec".into(),chapter_idx:Some(2)}).unwrap();
-    spec.nodes=internal_view(&conn,&query(book,"actual",1)).unwrap().nodes;
-    spec.events.push(GraphEvent{key:"expected-event".into(),title:"Future intent".into(),chapter_idx:2,order:1,participants:vec!["future-real-name".into()],location:None,summary:"".into(),outcome:"".into(),provenance:"ai_adapted".into()});
-    let conditions=vec![Precondition{key:"condition".into(),event_key:"expected-event".into(),subject_key:"future-real-name".into(),predicate:"life_status".into(),value:TypedValue{kind:"unknown".into(),value:None},assertion_kind:"confirmed".into(),evidence_refs:vec![]}];
-    save_spec_with_preconditions(&conn,book,2,&spec,&conditions,"spec-dep",0).unwrap();assert_eq!(spec_preconditions(&conn,book,2).unwrap(),conditions);
-    assert!(get_view(&conn,&query(book,"actual",1)).unwrap().events.is_empty());
-    let edit_id=edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})}).unwrap();assert!(spec_preconditions(&conn,book,2).unwrap().is_empty());
-    assert!(spec_matches(&conn,book,2,"spec-dep",0).is_err(), "old task cannot reactivate spec after reading-line change");
-    assert!(spec_preconditions(&conn,book,2).unwrap().is_empty());
-    revert(&conn,book,edit_id).unwrap();assert!(spec_matches(&conn,book,2,"spec-dep",line_version(&conn,book).unwrap()).unwrap());assert_eq!(spec_preconditions(&conn,book,2).unwrap(),conditions);
+fn local_migration_preserves_prose_pins_ids_and_legacy_meaning() {
+    let conn=Connection::open_in_memory().unwrap();Db::apply_pragmas(&conn).unwrap();conn.execute_batch(include_str!("../../../../migrations/0001_init.sql")).unwrap();conn.execute_batch(include_str!("../../../../migrations/0002_kg_facts.sql")).unwrap();conn.pragma_update(None,"user_version",2).unwrap();
+    conn.execute("INSERT INTO books(id,title,source_path,format) VALUES (1,'legacy','test','txt')",[]).unwrap();conn.execute("INSERT INTO chapters(book_id,idx,title,original_text) VALUES (1,1,'one','original bytes')",[]).unwrap();conn.execute("INSERT INTO kg_lines(book_id,progress,version) VALUES (1,1,7)",[]).unwrap();
+    conn.execute("INSERT INTO kg_text_versions(id,book_id,chapter_idx,source,content,content_hash) VALUES (9,1,1,'original','original bytes','hash')",[]).unwrap();conn.execute("INSERT INTO kg_read_selection VALUES (1,1,9)",[]).unwrap();
+    conn.execute("INSERT INTO kg_revisions(id,book_id,text_version_id,digest,dependency_digest,stage_a_version,stage_b_version,summary,open_threads_json,unresolved_json,active,schema_digest) VALUES (23,1,9,'d','dep','a','b','old summary','[]','[]',1,'old')",[]).unwrap();
+    conn.execute("INSERT INTO kg_records(revision_id,kind,key,subject_key,observed_chapter,observed_order,data_json) VALUES (23,'identity','hero','hero',1,0,?1)",[r#"{"key":"hero","entity_type":"character","name":"甲","aliases":[]}"#]).unwrap();
+    conn.execute("INSERT INTO graph_events(book_id,scope,chapter_idx,order_in_chapter,title,summary,outcome,provenance,revision_id,record_key,observed_chapter,observed_order,data_json) VALUES (1,'chapter',1,0,'battle','fought','won','ai_original',23,'battle',1,0,?1)",[r#"{"key":"battle","title":"battle","chapter_idx":1,"observed_order":0,"participants":["hero"],"location":null,"summary":"fought","outcome":"won"}"#]).unwrap();
+    conn.execute("INSERT INTO kg_records(revision_id,kind,key,subject_key,observed_chapter,observed_order,data_json) VALUES (23,'change','death','hero',1,1,?1)",[r#"{"subject_key":"hero","predicate":"life_status","operation":"set","after":{"kind":"scalar","value":"dead"},"temporal_scope":"current","assertion_kind":"confirmed"}"#]).unwrap();
+    conn.execute("INSERT INTO kg_records(revision_id,kind,key,subject_key,observed_chapter,observed_order,data_json) VALUES (23,'relation','old-rel','hero',1,0,?1)",[r#"{"src":"hero","dst":"hero","rel_type":"旧盟约","description":"promise","status":"broken","temporal_scope":"current","assertion_kind":"confirmed"}"#]).unwrap();
+    let before=r#"{"key":"old-rel","src":"hero","dst":"hero","rel_type":"旧盟约","description":"promise","status":"broken","since_chapter":1,"chapter_idx":2,"provenance":"user"}"#;
+    let after=r#"{"key":"old-rel","src":"hero","dst":"hero","rel_type":"旧盟约","description":"new promise","status":"former","since_chapter":1,"chapter_idx":2,"provenance":"user"}"#;
+    conn.execute("INSERT INTO edits_log(id,book_id,target_type,target_id,action,before_json,after_json,effective_from,scope,active) VALUES (41,1,'edge','old-rel','upsert',?1,?2,2,'global',1)",params![before,after]).unwrap();
+    conn.execute("INSERT INTO kg_specs(id,book_id,chapter_idx,dependency_digest,line_version,data_json,active) VALUES (51,1,2,'spec-dep',7,?1,1)",[r#"{"nodes":[{"key":"hero","type":"character","name":"甲","aliases":[],"summary":null,"chapter_idx":1,"provenance":"ai_original"}],"edges":[],"events":[],"purpose":"spec","reader_progress":1}"#]).unwrap();
+    Db::new(&conn).migrate().unwrap();assert_eq!(active_revision(&conn,9).unwrap(),Some(23));assert_eq!(selected_text(&conn,1,1).unwrap().unwrap().id,9);assert_eq!(line_version(&conn,1).unwrap(),7);let legacy=active_snapshot(&conn,9).unwrap().unwrap();assert!(legacy.events[0].summary.contains("won"));assert_eq!(legacy.events[0].key,"1:battle");assert!(!extraction_matches(&conn,9,&config()).unwrap());assert_eq!(coverage(&conn,1).unwrap().legacy_chapters,vec![1]);
+    assert_eq!(legacy.nodes[0].life_status.as_deref(),Some("dead"));assert!(legacy.edges[0].description.as_deref().unwrap().contains("broken"));assert!(!ready(&conn,9).unwrap());
+    let(before,after)=conn.query_row("SELECT before_json,after_json FROM edits_log WHERE id=41",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).unwrap();let before:GraphEdge=parse(&before).unwrap();let after:GraphEdge=parse(&after).unwrap();assert_eq!(before.key,"old-rel");assert!(before.description.unwrap().contains("broken"));assert!(after.description.unwrap().contains("former"));
+    assert_eq!(conn.query_row("SELECT legacy FROM kg_lite_specs WHERE id=51",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT count(*) FROM kg_extraction_plans",[],|r|r.get::<_,i64>(0)).unwrap(),0);
 }
-
 #[test]
-fn original_refinement_invalidates_generated_descendants_and_read_selection() {
-    let (conn,book)=fixture();let first=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&first,&bundle(1),"d",0,None).unwrap();mark_read(&conn,book,1).unwrap();
-    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})}).unwrap();
-    let generated=save_generated(&conn,book,2,"generated text","m","dep",1).unwrap();let mut b=bundle(2);b.spans[0].text="generated".into();b.spans[0].end_byte=9;commit_bundle(&conn,&generated,&b,"extract",1,None).unwrap();mark_read(&conn,book,2).unwrap();
-    let mut improved=bundle(1);improved.stage_a.summary="refinement".into();commit_bundle(&conn,&first,&improved,"new",1,None).unwrap();
-    assert!(selected_text(&conn,book,2).unwrap().is_none());assert!(!ready(&conn,generated.id).unwrap());
+fn same_text_reextract_preserves_edit_targets_and_all_state_references() {
+    let(conn,book)=fixture();let text=text_version(&conn,book,1,"original",None).unwrap();let mut old=snapshot(1);
+    let mut city=old.nodes[0].clone();city.key="city".into();city.entity_type="location".into();city.name="城".into();city.life_status=None;
+    let mut item=city.clone();item.key="sword".into();item.entity_type="item".into();item.name="剑".into();item.location=Some("city".into());item.owner=Some("hero".into());old.nodes[0].location=Some("city".into());old.nodes.extend([city,item]);
+    old.edges.push(GraphEdge{key:"old-rel".into(),src:"hero".into(),dst:"sword".into(),rel_type:"持有".into(),description:None,chapter_idx:1,provenance:"ai_original".into()});
+    old.events.push(GraphEvent{key:"1:old-event".into(),title:"出发".into(),chapter_idx:1,order:0,participants:vec!["hero".into()],location:Some("city".into()),time:None,summary:"出发".into(),provenance:"ai_original".into()});
+    commit_snapshot(&conn,&text,&old,"dep",0,None,&config()).unwrap();mark_read(&conn,book,1).unwrap();let hero=public_key(book,"n","hero");let edit_id=edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some(hero.clone()),action:"upsert".into(),data:serde_json::json!({"life_status":"dead"})}).unwrap();
+    let mut fresh=old.clone();for n in &mut fresh.nodes{n.key=format!("new-{}",n.key);n.location=n.location.as_ref().map(|s|format!("new-{s}"));n.owner=n.owner.as_ref().map(|s|format!("new-{s}"));}fresh.edges[0].key="new-rel".into();fresh.edges[0].src="new-hero".into();fresh.edges[0].dst="new-sword".into();fresh.events[0].key="new-event".into();fresh.events[0].participants=vec!["new-hero".into()];fresh.events[0].location=Some("new-city".into());
+    commit_snapshot(&conn,&text,&fresh,"dep",line_version(&conn,book).unwrap(),None,&config()).unwrap();let kept=active_snapshot(&conn,text.id).unwrap().unwrap();assert_eq!(kept,old);assert_eq!(active_edits(&conn,book).unwrap()[0].target_id,hero);revert(&conn,book,edit_id).unwrap();
 }
-
 #[test]
-fn replacing_read_generated_text_switches_pin_and_invalidates_later_selection() {
-    let (conn,book)=fixture();mark_read(&conn,book,1).unwrap();edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"branch"})}).unwrap();
-    let old=save_generated(&conn,book,2,"old text","m","old",1).unwrap();let later=save_generated(&conn,book,3,"later text","m","later",1).unwrap();mark_read(&conn,book,3).unwrap();
-    let replacement=save_generated(&conn,book,2,"new text","new-model","new",1).unwrap();assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().id,replacement.id);assert_ne!(old.id,replacement.id);assert!(selected_text(&conn,book,3).unwrap().is_none());
-    activate_cached(&conn,old.id,"old",1).unwrap();assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().id,old.id);assert!(selected_text(&conn,book,3).unwrap().is_none());assert!(!ready(&conn,later.id).unwrap());
+fn generated_cache_and_undo_do_not_mutate_archived_prose() {
+    let(conn,book)=fixture();commit(&conn,book,1);mark_read(&conn,book,1).unwrap();let key=public_key(book,"n","hero");let id=edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some(key),action:"upsert".into(),data:serde_json::json!({"life_status":"dead"})}).unwrap();
+    let line=line_version(&conn,book).unwrap();let text=save_generated(&conn,book,2,"selected new prose","writer","dep",line).unwrap();let mut generated=snapshot(2);generated.nodes[0].provenance="ai_generated".into();commit_snapshot(&conn,&text,&generated,"dep",line,None,&config()).unwrap();mark_read(&conn,book,2).unwrap();assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().id,text.id);
+    revert(&conn,book,id).unwrap();assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().source,"original");assert_eq!(by_id(&conn,text.id).unwrap().content,"selected new prose");assert!(activate_cached_for_config(&conn,text.id,"dep",line,&config()).is_err());
 }
-
 #[test]
-fn negative_directive_and_tombstone_are_explicit_generation_constraints() {
-    let (conn,book)=fixture();let first=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&first,&bundle(1),"d",0,None).unwrap();mark_read(&conn,book,1).unwrap();
-    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:serde_json::json!({"text":"甲死亡","polarity":"negative"})}).unwrap();
-    let key=get_view(&conn,&query(book,"actual",1)).unwrap().nodes[0].key.clone();edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),action:"delete".into(),key:Some(key),data:serde_json::json!({})}).unwrap();
-    let constraints=intent_constraints(&conn,book,2).unwrap();assert_eq!(constraints["directives"][0]["polarity"],"negative");assert_eq!(constraints["tombstones"][0]["key"],"future-real-name");assert_eq!(constraints["tombstones"][0]["data"]["name"],"甲");
-    let context=generation_context(&conn,book,2).unwrap();assert!(context.directives[0].contains("negative"));
+fn tombstones_negative_directives_and_opaque_auth_survive_cutover() {
+    let(conn,book)=fixture();commit(&conn,book,1);mark_read(&conn,book,1).unwrap();let input=EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some("hero".into()),action:"delete".into(),data:serde_json::json!({})};assert!(edit(&conn,&input).is_err());let mut deletion=input;deletion.key=Some(public_key(book,"n","hero"));edit(&conn,&deletion).unwrap();edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),key:None,action:"upsert".into(),data:serde_json::json!({"text":"不要复活甲","polarity":"negative"})}).unwrap();let constraints=intent_constraints(&conn,book,2).unwrap();assert_eq!(constraints["tombstones"][0]["key"],"hero");assert_eq!(constraints["directives"][0]["polarity"],"negative");assert!(internal_view(&conn,&query(book,"spec",2)).unwrap().nodes.is_empty());
 }
-
 #[test]
-fn user_node_intent_never_inherits_original_fact_evidence() {
-    let (conn,book)=fixture();for idx in 1..=2{let t=text_version(&conn,book,idx,"original",None).unwrap();commit_bundle(&conn,&t,&bundle(idx),"d",0,None).unwrap();}mark_read(&conn,book,1).unwrap();reveal(&conn,book,2).unwrap();
-    let key=get_view(&conn,&query(book,"spec",2)).unwrap().nodes[0].key.clone();assert!(!evidence(&conn,&query(book,"spec",2),"node",&key).unwrap().is_empty());
-    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),action:"upsert".into(),key:Some(key.clone()),data:serde_json::json!({"name":"Edited future intent"})}).unwrap();
-    assert!(evidence(&conn,&query(book,"spec",2),"node",&key).unwrap().is_empty());assert!(!evidence(&conn,&query(book,"actual",1),"node",&key).unwrap().is_empty());
+fn migrating_v1_keeps_active_prose_and_complete_archived_graph_metadata() {
+    let conn=Connection::open_in_memory().unwrap();Db::apply_pragmas(&conn).unwrap();conn.execute_batch(include_str!("../../../../migrations/0001_init.sql")).unwrap();conn.pragma_update(None,"user_version",1).unwrap();
+    conn.execute("INSERT INTO books(id,title,source_path,format) VALUES (1,'old','test','txt')",[]).unwrap();conn.execute("INSERT INTO chapters(book_id,idx,title,original_text) VALUES (1,1,'one','original')",[]).unwrap();conn.execute("INSERT INTO generated_chapters(id,book_id,chapter_idx,content,model,prompt_digest,active) VALUES (7,1,1,'unchanged chosen prose','writer','dep',1)",[]).unwrap();
+    conn.execute("INSERT INTO graph_nodes(book_id,scope,chapter_idx,key,type,name,provenance) VALUES (1,'chapter',1,'old-hero','character','甲','ai_original')",[]).unwrap();conn.execute("INSERT INTO graph_events(book_id,scope,chapter_idx,order_in_chapter,title,summary,outcome,provenance) VALUES (1,'chapter',1,3,'旧战役','战斗','胜利','ai_original')",[]).unwrap();
+    Db::new(&conn).migrate().unwrap();assert_eq!(conn.query_row("SELECT content FROM generated_chapters WHERE id=7 AND active=1",[],|r|r.get::<_,String>(0)).unwrap(),"unchanged chosen prose");
+    let data=conn.query_row("SELECT data_json FROM kg_legacy_archive WHERE source_table='graph_events'",[],|r|r.get::<_,String>(0)).unwrap();let value:Value=parse(&data).unwrap();assert_eq!(value["chapter_idx"],1);assert_eq!(value["order"],3);assert_eq!(value["outcome"],"胜利");assert_eq!(conn.query_row("SELECT count(*) FROM jobs",[],|r|r.get::<_,i64>(0)).unwrap(),0);
 }
-
 #[test]
-fn established_relation_status_change_requires_no_duplicate_observation() {
-    let (conn,book)=fixture();let mut first=bundle(1);first.stage_b.relations.push(RelationObservation{key:"relationship".into(),src:"future-real-name".into(),dst:"future-real-name".into(),rel_category:"alliance".into(),rel_type:"alliance".into(),status:"active".into(),description:None,chapter_idx:1,observed_chapter:1,observed_order:0,temporal_scope:"current".into(),assertion_kind:"confirmed".into(),evidence_refs:vec!["s".into()]});
-    let t=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&t,&first,"d",0,None).unwrap();
-    let mut second=bundle(2);second.stage_a.events.push(ExtractEvent{key:"break".into(),title:"Break".into(),category:"parting".into(),chapter_idx:2,observed_chapter:2,observed_order:0,temporal_scope:"current".into(),assertion_kind:"confirmed".into(),participants:vec!["future-real-name".into()],location:None,summary:"".into(),outcome:"".into(),cause_keys:vec![],evidence_refs:vec!["s".into()]});
-    second.stage_b.changes.push(Change{key:"break-status".into(),event_key:"break".into(),subject_key:"relationship".into(),predicate:"status".into(),operation:"set".into(),before:TypedValue{kind:"scalar".into(),value:Some("active".into())},after:TypedValue{kind:"scalar".into(),value:Some("broken".into())},chapter_idx:2,observed_chapter:2,observed_order:0,temporal_scope:"current".into(),assertion_kind:"confirmed".into(),evidence_refs:vec!["s".into()]});
-    second.stage_b.preconditions.push(Precondition{key:"prior-status".into(),event_key:"break".into(),subject_key:"relationship".into(),predicate:"status".into(),value:TypedValue{kind:"scalar".into(),value:Some("active".into())},assertion_kind:"confirmed".into(),evidence_refs:vec!["s".into()]});
-    let t=text_version(&conn,book,2,"original",None).unwrap();commit_bundle(&conn,&t,&second,"d",0,None).unwrap();mark_read(&conn,book,2).unwrap();
-    assert_eq!(get_view(&conn,&query(book,"actual",2)).unwrap().edges[0].status,"broken");assert_eq!(get_view(&conn,&query(book,"actual",1)).unwrap().edges[0].status,"active");
+fn null_latest_snapshot_preserves_confirmed_state_but_future_null_edits_clear_it() {
+    let(conn,book)=fixture();let first=text_version(&conn,book,1,"original",None).unwrap();let mut established=snapshot(1);established.nodes[0].aliases=vec!["旧别名".into()];established.nodes[0].summary=Some("已确认的描述".into());established.nodes[0].location=Some("city".into());
+    let mut city=established.nodes[0].clone();city.key="city".into();city.entity_type="location".into();city.name="城".into();city.aliases.clear();city.life_status=None;city.location=None;city.summary=None;
+    let mut item=city.clone();item.key="item".into();item.entity_type="item".into();item.name="剑".into();item.location=Some("city".into());item.owner=Some("hero".into());established.nodes.extend([city,item]);commit_snapshot(&conn,&first,&established,"dep",0,None,&config()).unwrap();
+    let second=text_version(&conn,book,2,"original",None).unwrap();let mut latest=established.clone();for n in &mut latest.nodes{n.chapter_idx=2;n.life_status=None;n.location=None;n.owner=None;n.summary=None;n.aliases.clear();}latest.nodes[0].aliases=vec!["新别名".into()];commit_snapshot(&conn,&second,&latest,"dep",0,None,&config()).unwrap();mark_read(&conn,book,2).unwrap();
+    let actual=internal_view(&conn,&query(book,"actual",2)).unwrap();let hero=actual.nodes.iter().find(|n|n.key=="hero").unwrap();let item=actual.nodes.iter().find(|n|n.key=="item").unwrap();assert_eq!(hero.life_status.as_deref(),Some("alive"));assert_eq!(hero.location.as_deref(),Some("city"));assert_eq!(hero.summary.as_deref(),Some("已确认的描述"));assert_eq!(hero.aliases,vec!["旧别名","新别名"]);assert_eq!(item.location.as_deref(),Some("city"));assert_eq!(item.owner.as_deref(),Some("hero"));assert!(active_snapshot(&conn,second.id).unwrap().unwrap().nodes[0].life_status.is_none());
+    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some(public_key(book,"n","hero")),action:"upsert".into(),data:serde_json::json!({"life_status":null,"location":null,"aliases":[]})}).unwrap();
+    edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),key:Some(public_key(book,"n","item")),action:"upsert".into(),data:serde_json::json!({"owner":null,"location":null})}).unwrap();
+    let spec=internal_view(&conn,&query(book,"spec",3)).unwrap();let future_hero=spec.nodes.iter().find(|n|n.key=="hero").unwrap();let future_item=spec.nodes.iter().find(|n|n.key=="item").unwrap();assert!(future_hero.life_status.is_none());assert!(future_hero.location.is_none());assert!(future_hero.aliases.is_empty());assert!(future_item.location.is_none());assert!(future_item.owner.is_none());
+    let unchanged=internal_view(&conn,&query(book,"actual",2)).unwrap();assert_eq!(unchanged.nodes,actual.nodes);
 }
-
 #[test]
-fn identity_merge_projects_target_name_and_summary_deterministically() {
-    let (conn,book)=fixture();let mut first=bundle(1);first.identities.push(Identity{key:"masked".into(),entity_type:"character".into(),name:"蒙面人".into(),aliases:vec![]});let mut f=first.stage_b.facts[0].clone();f.key="mask-name".into();f.subject_key="masked".into();f.value.value=Some("蒙面人".into());first.stage_b.facts.push(f);
-    let t=text_version(&conn,book,1,"original",None).unwrap();commit_bundle(&conn,&t,&first,"d",0,None).unwrap();let mut second=bundle(2);second.identity_links.push(IdentityLink{from_key:"masked".into(),to_key:"future-real-name".into(),observed_chapter:2,observed_order:0,evidence_refs:vec!["s".into()]});let t=text_version(&conn,book,2,"original",None).unwrap();commit_bundle(&conn,&t,&second,"d",0,None).unwrap();mark_read(&conn,book,2).unwrap();
-    let baseline=serde_json::to_string(&get_view(&conn,&query(book,"actual",2)).unwrap()).unwrap();for _ in 0..20{let view=get_view(&conn,&query(book,"actual",2)).unwrap();assert_eq!(view.nodes.len(),1);assert_eq!(view.nodes[0].name,"甲");assert_eq!(serde_json::to_string(&view).unwrap(),baseline);}
+fn original_jump_only_materializes_target_but_generated_jump_pins_chosen_chain() {
+    let(conn,book)=fixture();mark_read(&conn,book,4).unwrap();assert_eq!(progress(&conn,book).unwrap(),4);assert_eq!(conn.query_row("SELECT count(*) FROM kg_text_versions",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT count(*) FROM kg_read_selection",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let(conn,book)=fixture();mark_read(&conn,book,1).unwrap();edit(&conn,&EditInput{book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),key:None,action:"upsert".into(),data:serde_json::json!({"text":"chosen story","polarity":"positive"})}).unwrap();let line=line_version(&conn,book).unwrap();let second=save_generated(&conn,book,2,"chosen two","writer","two",line).unwrap();let third=save_generated(&conn,book,3,"chosen three","writer","three",line).unwrap();mark_read(&conn,book,3).unwrap();assert_eq!(selected_text(&conn,book,2).unwrap().unwrap().id,second.id);assert_eq!(selected_text(&conn,book,3).unwrap().unwrap().id,third.id);assert_eq!(conn.query_row("SELECT count(*) FROM kg_read_selection",[],|r|r.get::<_,i64>(0)).unwrap(),3);
+    assert!(mark_read(&conn,book,4).is_err());assert_eq!(progress(&conn,book).unwrap(),3);
 }

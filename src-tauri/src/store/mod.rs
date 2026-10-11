@@ -3,12 +3,17 @@
 // 避免运行期相对路径在桌面/移动端的不同 cwd 下找不到文件）。
 
 use rusqlite::Connection;
+mod kg_migration;
+#[cfg(test)]
+mod kg_migration_tests;
 
 // 迁移清单：新增迁移时按序追加 (版本号, 文件内容)。
 // 版本号 = 文件名前缀，user_version 记录已应用的最新版本。
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../../migrations/0001_init.sql")),
     (2, include_str!("../../../migrations/0002_kg_facts.sql")),
+    (3, include_str!("../../../migrations/0003_kg_lite.sql")),
+    (4, include_str!("../../../migrations/0004_story_wiki.sql")),
 ];
 
 pub struct Db<'a> {
@@ -38,7 +43,14 @@ impl<'a> Db<'a> {
                 continue;
             }
             self.conn.execute_batch("BEGIN")?;
-            match self.conn.execute_batch(sql) {
+            let result=(||->rusqlite::Result<()>{
+                if *version==2{kg_migration::before_facts(self.conn)?;}
+                self.conn.execute_batch(sql)?;
+                if *version==2{kg_migration::after_facts(self.conn)?;}
+                if *version==3{kg_migration::migrate(self.conn)?;}
+                Ok(())
+            })();
+            match result {
                 Ok(_) => {
                     self.conn.pragma_update(None, "user_version", version)?;
                     self.conn.execute_batch("COMMIT")?;
@@ -81,5 +93,27 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod story_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn story_tables_migrate_idempotently_and_preserve_old_intent_log() {
+        let conn = Connection::open_in_memory().unwrap();
+        Db::apply_pragmas(&conn).unwrap();
+        Db::new(&conn).migrate().unwrap();
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('story_interventions','story_next_wiki_revisions','story_chapter_revisions')", [], |r| r.get(0)).unwrap();
+        assert_eq!(tables, 3);
+        Db::new(&conn).migrate().unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM edits_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+}
 pub mod books;
+pub mod story;
 pub mod kg;
+pub mod story_projection;

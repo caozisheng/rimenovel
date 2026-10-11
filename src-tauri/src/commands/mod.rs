@@ -41,6 +41,7 @@ fn derive_title(path: &Path, chapters: &[NewChapter]) -> String {
 
 #[tauri::command]
 pub fn import_book(app: tauri::AppHandle, state: tauri::State<AppState>, path: String) -> Result<i64, String> {
+    let budget_started_ms = kg::epoch_ms();
     let p = Path::new(&path);
     let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
     let opts = SplitOptions::default();
@@ -71,7 +72,7 @@ pub fn import_book(app: tauri::AppHandle, state: tauri::State<AppState>, path: S
         create_book_with_chapters(conn, &title, None, format, &path, &chapters)
             .map_err(|e| format!("入库失败: {e}"))?
     };
-    kg::schedule_book(app, id, None)?;
+    kg::schedule_book(app, id, None, budget_started_ms)?;
     Ok(id)
 }
 
@@ -132,8 +133,15 @@ pub struct ChapterContent {
     pub idx: i64,
     pub title: String,
     pub content: String,
-    pub source: String, // selected immutable original/generated text version
+    pub source: String,
+    pub reading_mode: String,
+    pub rewrite_status: String,
     pub graph_error: Option<String>,
+}
+
+fn original_graph_error(conn: &Connection, book_id: i64, idx: i64) -> Result<Option<String>, String> {
+    let text = crate::store::kg::text_version(conn, book_id, idx, "original", None)?;
+    Ok((!crate::store::kg::ready(conn, text.id)?).then(|| "本章图谱尚未抽取；原文可正常阅读，当前章与下一章异步预取".into()))
 }
 
 #[tauri::command]
@@ -142,55 +150,73 @@ pub async fn get_chapter_cmd(
     state: tauri::State<'_, AppState>,
     book_id: i64,
     idx: i64,
+    mode: String,
 ) -> Result<ChapterContent, String> {
-    let (title, original, needs_generation, line_version) = {
+    let reading_mode = match mode.as_str() { "original" | "rewrite" => mode, _ => return Err("阅读模式必须是 original 或 rewrite".into()) };
+    let (title, needs_generation, line_version, mut content, mut source, mut rewrite_status) = {
         let guard = state.db.lock();
         let conn = guard.as_ref().ok_or("数据库未初始化")?;
-        let generated = crate::store::kg::divergence(conn, book_id)?.is_some_and(|from| idx >= from);
-        let (title, text) = if generated {
-            let title = conn.query_row("SELECT title FROM chapters WHERE book_id=?1 AND idx=?2", rusqlite::params![book_id, idx], |r| r.get::<_, String>(0))
-                .map_err(|e| e.to_string())?;
-            (title, String::new())
+        let (title, original_text) = get_chapter(conn, book_id, idx).map_err(|e| e.to_string())?.ok_or_else(|| format!("章节不存在: {idx}"))?;
+        let line_version = crate::store::kg::line_version(conn, book_id)?;
+        if reading_mode == "original" {
+            (title, false, line_version, original_text, "original".to_owned(), "ready".to_owned())
+        } else if let Some(generated) = crate::store::kg::active_generated_text(conn, book_id, idx)? {
+            (title, false, line_version, generated.content, "generated".to_owned(), "ready".to_owned())
+        } else if crate::store::story::active_next_wiki(conn, book_id, idx)?.is_some() {
+            (title, true, line_version, String::new(), "rewrite".to_owned(), "generating".to_owned())
+        } else if idx == 1 || !crate::store::kg::has_generated_before(conn, book_id, idx)? {
+            (title, false, line_version, original_text, "original".to_owned(), "inherited".to_owned())
         } else {
-            get_chapter(conn, book_id, idx).map_err(|e| e.to_string())?.ok_or_else(|| format!("章节不存在: {idx}"))?
-        };
-        (title, text, generated, crate::store::kg::line_version(conn, book_id)?)
+            (title, false, line_version, String::new(), "rewrite".to_owned(), "unavailable".to_owned())
+        }
     };
     let mut graph_error = None;
-    let (content, source) = if needs_generation {
+    if needs_generation {
         let selected = match kg::ensure_selected(&app, &state, book_id, idx, None).await {
             Ok(text) => text,
             Err(error) if crate::core::kg_generate::completed_stage_error(&error) => {
                 let saved = {
                     let guard = state.db.lock();
-                    crate::core::kg_generate::saved_readable_after_stage_error(
-                        guard.as_ref().ok_or("数据库未初始化")?, book_id, idx, line_version,
-                    )?
+                    crate::core::kg_generate::saved_readable_after_stage_error(guard.as_ref().ok_or("数据库未初始化")?, book_id, idx, line_version)?
                 }.ok_or_else(|| error.clone())?;
                 graph_error = Some(error);
                 saved
             }
             Err(error) => return Err(error),
         };
-        (selected.content, selected.source)
-    } else {
-        (original, "original".into())
-    };
+        content = selected.content;
+        source = selected.source;
+        rewrite_status = "ready".into();
+    } else if reading_mode == "original" {
+        let guard = state.db.lock();
+        graph_error = original_graph_error(guard.as_ref().ok_or("数据库未初始化")?, book_id, idx)?;
+    }
     {
         let guard = state.db.lock();
         let conn = guard.as_ref().ok_or("数据库未初始化")?;
-        if crate::store::kg::line_version(conn, book_id)? != line_version {
-            return Err("阅读线已变化，请重新打开本章".into());
-        }
-        crate::store::kg::mark_read(conn, book_id, idx)?;
+        if crate::store::kg::line_version(conn, book_id)? != line_version { return Err("阅读线已变化，请重新打开本章".into()); }
+        if reading_mode == "original" { crate::store::kg::mark_read(conn, book_id, idx)?; }
     }
-    kg::prefetch_next(app, book_id);
-    Ok(ChapterContent { idx, title, content, source, graph_error })
+    if reading_mode == "original" { kg::prefetch_next(app, book_id); }
+    Ok(ChapterContent { idx, title, content, source, reading_mode, rewrite_status, graph_error })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_original_graph_allows_jump_without_creating_skipped_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::Db::new(&conn).migrate().unwrap();
+        let chapters: Vec<_> = (1..=100).map(|idx| NewChapter { idx, title: format!("Chapter {idx}"), text: format!("Original prose {idx}"), token_est: 10 }).collect();
+        let book = create_book_with_chapters(&conn, "Sparse reader", None, "txt", "test", &chapters).unwrap();
+        assert!(original_graph_error(&conn, book, 99).unwrap().is_some());
+        assert_eq!(get_chapter(&conn, book, 99).unwrap().unwrap().1, "Original prose 99");
+        let created: i64 = conn.query_row("SELECT COUNT(*) FROM kg_text_versions WHERE book_id=?1", [book], |r| r.get(0)).unwrap();
+        assert_eq!(created, 1);
+        assert_eq!(crate::store::kg::progress(&conn, book).unwrap(), 0);
+    }
 
     #[test]
     fn token_est_rough_count() {
@@ -224,3 +250,4 @@ pub mod providers;
 
 pub mod status;
 pub mod kg;
+pub mod story;

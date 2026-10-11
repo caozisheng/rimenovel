@@ -7,6 +7,8 @@ export interface Book {
   source_path: string;
 }
 
+export type ReadingMode = "original" | "rewrite";
+export type RewriteStatus = "ready" | "inherited" | "generating" | "unavailable";
 export interface ChapterMeta {
   idx: number;
   title: string;
@@ -17,6 +19,8 @@ export interface ChapterContent {
   title: string;
   content: string;
   source: string;
+  reading_mode: ReadingMode;
+  rewrite_status: RewriteStatus;
   graph_error?: string | null;
 }
 export interface ProviderRow {

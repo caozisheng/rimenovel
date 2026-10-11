@@ -2,7 +2,7 @@
 
 <img width="128" height="128" alt="rimenovel-icon" src="https://github.com/user-attachments/assets/f1bedd95-909e-454e-926f-9b339ab64654" />
 
-A novel reader where readers can influence the story direction: import a novel → extract a dual-layer knowledge graph (global/chapter) → visualize and edit → AI generates subsequent chapters based on the edited graph.
+小说阅读器：导入小说 → 按章整理轻量 Wiki → 阅读时查看只读 StoryMap → 通过三道迷雾选择题或一句话影响下一章 → 生成并继续阅读。
 
 ## Development
 
@@ -22,24 +22,23 @@ Tech stack: Tauri 2 · Rust (tokio/reqwest/rusqlite) · Vue 3 · TS · Naive UI 
 - The reader has independent paper, sepia, and night themes, a serif font stack, 1.9 line height, paragraph indentation, and live 16–22 px font sizing. Its controls and Provider form adapt to narrow screens.
 - `pnpm dev` previews the frontend only. Import, chapters, and Provider operations require the Tauri backend; use `pnpm tauri dev` for desktop use.
 
-## Knowledge-graph visualization
+# 轻量 Wiki 与 StoryMap
 
-`src/components/GraphVisualization.vue` is a read-only, props-driven Cytoscape/fcose view with entity-type filters, source colors, element properties, and a linked event timeline. Desktop uses three panes; narrow screens use a full canvas and a bottom property sheet. Pinia and the shared CSS tokens must be installed by the host.
+`src/components/WikiWorkbench.vue` 是阅读器内的只读故事工作台。它展示截至当前阅读线的 Wiki 条目、章节卡片、已知状态、关联条目和未解线索；用户不直接编辑节点、边或 Wiki 字段。
 
-Pass `nodes`, `edges`, `events`, and an explicit `purpose` (`actual`, `reference`, or `spec`). These are public presentation records from `src/lib/graph.ts`, not LLM extraction envelopes. The backend adapter must provide already-authorized names, aliases, references, and opaque public IDs; the component does not receive a complete future graph and redact it locally. Provenance colors indicate origin, not fact eligibility; user records are labeled as intent.
+- 每章只产生一份轻量章节整理，保留摘要、主要人物/地点/物品、关系、已确认状态和未解线索；不再把章内时间线拆成多个事件并逐事件计算图谱。
+- Wiki 是系统的速查和续写约束，不是第二份正文。原文、生成正文和章节整理按选中阅读线与版本保存，未读章节不会出现在公开历史中。
+- Reader 的 `Wiki / StoryMap` 面板支持跳转章节。章节正文仍保留原文或生成阅读线来源，整理失败不阻止已保存正文阅读。
+- 下一章干预只通过每批恰好三道迷雾选择题和可选自由文字提交。文字覆盖冲突选项；未回答的问题不产生约束；已提交答案保留在历史中。
+- 顶栏可在“原文”和“改写”之间切换。两条阅读线独立持久化：切换不会删除用户干预、规划或已生成章节；改写尚未到达的章节不会静默冒充已改写内容。
+- 改写正文按章节逐步保存，改写线不等待全书分析完成。分析/Wiki 是旁路记忆，改写生成、保存和阅读可以独立推进。
+- 题批和下一章规划使用独立结构化响应。规划未完成时不能以旧图谱或隐藏原作细节替代；正文生成只接收历史 Wiki、上一章选中完整正文和有效下一章规划。
 
-Chapter navigation is opt-in: pass `canJump` with a real `jump(chapterIdx)` handler. The reading workbench loads this view lazily; extraction and mutation stay in Rust, not in the rendering component.
+## 导入与运行
 
-## Evidence-backed knowledge graph
-
-- Import queues book extraction. Stage A extracts evidence-backed event/mention candidates; identity decisions align them; Stage B extracts facts, independently keyed relationships, changes, and event prerequisites. Long chapters are internally budgeted by UTF-8-safe spans without changing the original chapter list.
-- Immutable text versions and whole extraction revisions own every evidence range and fact. Global and chapter graphs are projections of the same records. Current facts, original reference, and future specifications are queried separately; future AI details and identity names are hidden server-side until authorized.
-- Reading opens original text before the earliest active edit, and generated text afterward. Future graph edits, directives and drift preferences leave already-observed facts unchanged. Generation streams prose, back-extracts that exact text version, then reconciles the next specification. Saved prose remains readable with a warning if a later graph stage fails; dependent generation waits for actual facts.
-- Revoking edits invalidates dependent selections and returns to the deterministic reading line. Cached prose/facts/specifications are reused only when immutable content, prior facts, identity dependencies and extraction/refinement versions match. Old model graph rows without evidence are archived for re-extraction, not treated as new facts.
-- Configure extract, merge and write models in Provider settings. Context and output budgets default to 32,768 and 4,096 tokens and can be adjusted. In-flight work is serialized per book and globally limited; a foreground request waits for the current chapter transaction boundary, then precedes the next queued background chapter.
-- Saved Providers can be edited from the list; saving updates the same ID even after a rename. Connection settings, models and budgets are filled in, but credentials are never returned to the form: leave API Key blank to retain it or enter a new key to replace it. Cancel discards the draft; creating a Provider requires a key and an unused name.
-- The workbench exposes read-only current facts/original reference and editable next-chapter/global future intent. Blind user-created intent stays visible; AI details require the spoiler-confirmation reveal gate. Selected elements support evidence lookup, future changes/deletion, and edit-history reversal. The reader shows target-chapter stream deltas while loading, then replaces them with the saved authoritative text.
-- The workbench shows durable background task kind, state, chapter, phase, attempt, retry delay, progress and failure details. Running work takes priority over queued successors; failed prefetch blockers remain visible and actionable. Start/retry explicitly without reimporting, or cancel all unfinished tasks for the current book. Closing the workbench does not cancel work. Events and three-second refreshes read SQLite status; progress advances on committed chapters, not guessed model-token percentages.
+- 导入只保留原书章节划分；章节整理在后台按预算执行，缓存命中不重复付费请求。
+- `pnpm dev` 仅预览前端；导入、章节、Provider、Wiki 规划和正文生成需要 Tauri 后端，使用 `pnpm tauri dev`。
+- Provider 分别配置 extract、merge、write 模型。真实模型质量、延迟和整书成本必须单独验收，不由离线测试推断。
 - Database and the current credential vault live in Tauri's application-data directory. A first launch migrates a legacy working-directory database without overwriting existing application data. `RIMENOVEL_DATA_DIR` selects an isolated data directory for smoke runs. Credentials still use the existing local vault; this is not an OS-keyring security claim.
 
 ## LLM adapters and bounded execution

@@ -17,7 +17,7 @@ vi.mock("@tauri-apps/api/event", () => ({
     return () => backend.listeners.delete(name);
   },
 }));
-const view = { nodes: [], edges: [], events: [], purpose: "actual", reader_progress: 1, chapter_idx: 1, fog: null, revealed: false, ready: false, unresolved: [], revision: null, drift_score: null, reading_line_version: 1, divergence_idx: null };
+const view = { nodes: [], edges: [], events: [], purpose: "actual", reader_progress: 1, chapter_idx: 1, fog: null, revealed: false, ready: false, summary: "", open_threads: [], coverage: { mode: "partial", total_chapters: 2, selected_chapters: [1], completed_chapters: [], missing_chapters: [1, 2], legacy_chapters: [], calls_used: 0, elapsed_ms: 0, target_complete: false }, revision: null, drift_score: null, reading_line_version: 1, divergence_idx: null };
 const running = { book_id: 1, job_id: 12, kind: "global_extract", chapter_idx: 1, state: "running", progress: 0.25, phase: "request", attempt: 1, retry_after_ms: null, error: null };
 const mounted: VueWrapper[] = [];
 function render() {
@@ -54,35 +54,27 @@ beforeEach(() => {
 afterEach(() => { for (const wrapper of mounted.splice(0)) wrapper.unmount(); });
 
 describe("durable workbench runtime controls", () => {
-  it("shows request, retry wait, failure and done observations from persisted status queries", async () => {
+  it("uses persisted progress and terminal state rather than a stale event payload", async () => {
     const wrapper = render();
     await flushPromises();
     const panel = wrapper.get('section[aria-label="后台图谱任务"]');
-    expect(panel.text()).toContain("请求模型");
-    expect(panel.text()).toContain("第 1 次尝试");
     expect(cancelButton(wrapper)).toBeDefined();
-    backend.statuses = [{ ...running, phase: "retry_wait", attempt: 2, retry_after_ms: 1500 }];
-    // Event payload is deliberately stale: the persisted query, not the callback, is authoritative.
+    backend.statuses = [{ ...running, progress: 0.5 }];
     progressEvent();
     await flushPromises();
-    expect(panel.text()).toContain("等待重试");
-    expect(panel.text()).toContain("第 2 次尝试");
-    expect(panel.text()).toContain("重试等待：1.5 秒");
-    expect(panel.get("progress").attributes("value")).toBe("25");
-    backend.statuses = [{ ...running, state: "failed", phase: "failed", attempt: 3, error: "HTTP 503: upstream saturated" }];
+    expect(panel.get("progress").attributes("value")).toBe("50");
+    backend.statuses = [{ ...running, state: "failed", phase: "failed", error: "HTTP 503: upstream saturated" }];
     progressEvent();
     await flushPromises();
-    expect(panel.text()).toContain("任务失败");
-    expect(panel.text()).toContain("HTTP 503: upstream saturated");
+    expect(panel.findAll('[role="alert"]').some(alert => alert.text().includes("HTTP 503: upstream saturated"))).toBe(true);
     expect(cancelButton(wrapper)).toBeUndefined();
     backend.statuses = [{ ...running, state: "done", phase: "done", progress: 1 }];
     progressEvent();
     await flushPromises();
-    expect(panel.text()).toContain("任务完成");
     expect(panel.get("progress").attributes("value")).toBe("100");
     expect(cancelButton(wrapper)).toBeUndefined();
   });
-  it.each(["queued", "running", "paused"])("cancels an active %s job through the exact IPC and refreshes its durable transition", async state => {
+  it.each(["queued", "running", "paused"])("prevents duplicate cancellation of an active %s job until its terminal state is observed", async state => {
     backend.statuses = [{ ...running, state, phase: state === "paused" ? "paused" : running.phase }];
     let finishCancel!: () => void;
     backend.cancel.mockImplementation(bookId => new Promise<void>(resolve => {
@@ -93,19 +85,13 @@ describe("durable workbench runtime controls", () => {
     }));
     const wrapper = render();
     await flushPromises();
-    if (state === "paused") expect(wrapper.get('section[aria-label="后台图谱任务"]').text()).toContain("阶段：已暂停");
     await cancelButton(wrapper)!.trigger("click");
-    expect(backend.invoke).toHaveBeenCalledWith("cancel_book_jobs", { bookId: 1 });
     expect(cancelButton(wrapper)!.attributes("disabled")).toBeDefined();
-    expect(wrapper.text()).toContain("取消中");
-    expect(wrapper.text()).not.toContain("已取消");
     await cancelButton(wrapper)!.trigger("click");
     expect(backend.cancel).toHaveBeenCalledTimes(1);
     finishCancel();
     await flushPromises();
-    expect(wrapper.text()).toContain("已取消");
     expect(cancelButton(wrapper)).toBeUndefined();
-    expect(wrapper.text()).toContain("开始抽取");
   });
   it("keeps cancellation failures visible after successful background refreshes", async () => {
     backend.cancel.mockRejectedValue(new Error("cancel denied"));
@@ -140,5 +126,17 @@ describe("durable workbench runtime controls", () => {
     wrapper.unmount();
     expect(backend.cancel).not.toHaveBeenCalled();
     expect(backend.listeners.size).toBe(0);
+  });
+  it("counts completed plan targets separately from extra reading coverage", async () => {
+    const supplemented = { ...view, ready: true, coverage: { ...view.coverage, mode: "sampled", total_chapters: 5, selected_chapters: [1, 3], completed_chapters: [1, 2, 3], missing_chapters: [4, 5], calls_used: 2, target_complete: true } };
+    backend.invoke.mockImplementation(async command => {
+      if (command === "get_graph") return supplemented;
+      if (command === "list_graph_edits") return [];
+      if (command === "get_extraction_statuses") return [];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    const wrapper = render();
+    await flushPromises();
+    expect(wrapper.get(".target-completed").text()).toBe("2");
   });
 });

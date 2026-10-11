@@ -91,8 +91,10 @@ pub fn make_client(cfg: ProviderConfig) -> Result<Box<dyn crate::llm::LlmClient>
 
 pub fn make_client_with_control(cfg: ProviderConfig, control: crate::llm::policy::CallControl) -> Result<Box<dyn crate::llm::LlmClient>, String> {
     let secret = cfg.api_key.clone();
+    // Reasoning may be silent before the first byte. Bound the whole attempt,
+    // rather than aborting a valid slow response after a shorter idle interval.
     let http = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15))
-        .retry(reqwest::retry::never()).read_timeout(std::time::Duration::from_secs(60))
+        .retry(reqwest::retry::never())
         .timeout(std::time::Duration::from_secs(180)).build().map_err(|error| error.to_string())?;
     let adapter: Box<dyn crate::llm::LlmClient> = match cfg.protocol.as_str() {
         "openai" => Box::new(crate::llm::openai::OpenAiClient { cfg, http }),
@@ -397,5 +399,45 @@ mod tests {
         assert_eq!(stored.context_limit, Some(32768));
         invalid.output_reserve = Some(0);
         assert!(save_provider(&conn, &invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_slow_first_response_can_complete_within_the_attempt_deadline() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" { break; }
+                if let Some((name,value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") { content_length = value.trim().parse::<usize>().unwrap(); }
+                }
+            }
+            reader.read_exact(&mut vec![0;content_length]).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"summary\\\":\\\"抵达岳阳\\\"}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            let _ = reader.into_inner().write_all(response.as_bytes()).await;
+        });
+        let cfg = ProviderConfig {id:1,name:"slow-provider".into(),protocol:"openai".into(),base_url:format!("http://{address}"),model_extract:Some("extract".into()),model_write:None,model_merge:None,api_key:"test".into()};
+        let client = make_client(cfg).unwrap();
+        let request = tokio::spawn(async move {
+            let schema = json!({"type":"object","additionalProperties":false,"required":["summary"],"properties":{"summary":{"type":"string"}}});
+            client.structured(crate::llm::StructuredRequest {task:crate::llm::TaskKind::Extract,messages:vec![crate::llm::ChatMessage {role:"user".into(),content:"概括旅人到达岳阳的事件".into()}],schema:&schema,schema_name:"slow_extract",temperature:0.0,max_tokens:128}).await
+        });
+        accepted_rx.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(65)).await;
+        reply_tx.send(()).unwrap();
+        assert_eq!(request.await.unwrap().unwrap(),json!({"summary":"抵达岳阳"}));
+        server.await.unwrap();
     }
 }

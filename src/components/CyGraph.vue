@@ -28,7 +28,6 @@ function applyStyles(): void {
     { selector: 'node[type = "faction"]', style: { shape: "hexagon" } },
     { selector: 'node[type = "concept"]', style: { shape: "ellipse", "border-width": 2, "border-style": "dashed", "border-color": text } },
     { selector: "edge", style: { label: "data(label)", width: 2, "line-color": "data(color)", "target-arrow-color": "data(color)", "target-arrow-shape": "triangle", "curve-style": "bezier", color: text, "font-size": 10, "text-rotation": "autorotate", "text-background-color": tokens.getPropertyValue("--color-surface-raised").trim(), "text-background-opacity": 0.85, "text-background-padding": "3px" } },
-    { selector: 'edge[status = "broken"], edge[status = "former"]', style: { "line-style": "dashed", opacity: 0.6 } },
     { selector: ".chosen, .event-highlight", style: { "border-width": 4, "border-color": accent, "overlay-color": accent, "overlay-opacity": 0.15, "overlay-padding": 8 } },
     { selector: "edge.chosen", style: { width: 5, "line-color": accent, "target-arrow-color": accent } },
   ]);
@@ -63,7 +62,7 @@ function renderGraph(): void {
     cy?.elements().remove();
     cy?.add([
       ...props.nodes.map((node) => ({ data: { id: nodeId(node.key), key: node.key, label: node.name, type: node.type, provenance: node.provenance, color: colors[node.provenance] } })),
-      ...props.edges.map((edge) => ({ data: { id: edgeId(edge.key), key: edge.key, source: nodeId(edge.src), target: nodeId(edge.dst), label: edge.rel_type, status: edge.status, provenance: edge.provenance, color: colors[edge.provenance] } })),
+      ...props.edges.map((edge) => ({ data: { id: edgeId(edge.key), key: edge.key, source: nodeId(edge.src), target: nodeId(edge.dst), label: edge.rel_type, provenance: edge.provenance, color: colors[edge.provenance] } })),
     ]);
   });
   applyStyles();
