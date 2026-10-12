@@ -75,7 +75,10 @@ pub fn validate_snapshot(snapshot:&ChapterSnapshot)->Result<(),String> {
     }
     let location=|key:&str| nodes.get(key).is_some_and(|node|node.entity_type=="location");
     for node in &snapshot.nodes {
-        if node.location.as_deref().is_some_and(|key|!location(key)) {return Err("invalid entity location reference".into());}
+        if let Some(key)=node.location.as_deref().filter(|key|!location(key)) {
+            let target=nodes.get(key).map(|target|format!("{} ({})",target.name,target.entity_type)).unwrap_or_else(||"未声明实体".into());
+            return Err(format!("invalid entity location reference: {} 的 location 指向 {target} [{key}]，必须指向 location 实体",node.name));
+        }
         if node.owner.as_deref().is_some_and(|key|!nodes.get(key).is_some_and(|owner|["character","faction"].contains(&owner.entity_type.as_str()))) {return Err("invalid item owner reference".into());}
     }
     let mut keys=HashSet::with_capacity(snapshot.edges.len());

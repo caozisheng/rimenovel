@@ -16,12 +16,12 @@ impl LlmClient for CompactClient {
         Ok(StructuredResponse {value:json!({
             "summary":"阿岚持剑抵达客栈，等待同伴。",
             "entities":[
-                {"ref":"a","type":"character","name":"阿岚","aliases":[],"description":"受伤但活着","life_status":"alive","location":"p","owner":null},
-                {"ref":"p","type":"location","name":"客栈","aliases":[],"description":"暂时落脚处","life_status":null,"location":null,"owner":null},
-                {"ref":"s","type":"item","name":"宝剑","aliases":[],"description":"随身武器","life_status":null,"location":"p","owner":"a"}
+                {"ref":"c_a","type":"character","name":"阿岚","aliases":[],"description":"受伤但活着","life_status":"alive","location":"l_p","owner":null},
+                {"ref":"l_p","type":"location","name":"客栈","aliases":[],"description":"暂时落脚处","life_status":null,"location":null,"owner":null},
+                {"ref":"i_s","type":"item","name":"宝剑","aliases":[],"description":"随身武器","life_status":null,"location":"l_p","owner":"c_a"}
             ],
-            "relations":[{"from":"a","to":"s","label":"持有","description":"阿岚携带宝剑"}],
-            "events":[{"title":"抵达客栈","participants":["a"],"location":"p","time":"夜间","summary":"阿岚持剑进入客栈"}],
+            "relations":[{"from":"c_a","to":"i_s","label":"持有","description":"阿岚携带宝剑"}],
+            "events":[{"title":"抵达客栈","participants":["c_a"],"location":"l_p","time":"夜间","summary":"阿岚持剑进入客栈"}],
             "open_threads":["同伴尚未抵达"]
         }),usage:Some((4100,420))})
     }
@@ -82,6 +82,31 @@ async fn a_slow_successful_chapter_is_not_rejected_by_the_experience_target(){
     let result=crate::core::kg_extract::extract(&state,&CompactClient{calls:calls.clone(),hang:false,delay:Some(std::time::Duration::from_secs(10))},text,&config,None).await;
     assert!(result.is_ok());assert_eq!(calls.load(Ordering::SeqCst),1);
     let view=kg::internal_view(state.db.lock().as_ref().unwrap(),&GraphQuery{book_id:book,scope:"chapter".into(),purpose:"reference".into(),chapter_idx:Some(1)}).unwrap();assert!(view.ready);
+}
+
+#[test]
+fn request_contract_rejects_character_references_as_locations(){
+    let (_,_,text,_)=setup_content("甲在客栈".into());
+    let known=super::decode_graph(json!({"summary":"甲在客栈","entities":[
+        {"ref":"a","type":"character","name":"甲","aliases":[],"description":"旅人","life_status":null,"location":"p","owner":null},
+        {"ref":"p","type":"location","name":"客栈","aliases":[],"description":"地点","life_status":null,"location":null,"owner":null}
+    ],"relations":[],"events":[],"open_threads":[]}),&text,&[],"ai_original").unwrap();
+    let schema=super::extraction_schema(&known.nodes);
+    let validator=jsonschema::validator_for(&schema).unwrap();
+    let mut reply=json!({"summary":"乙抵达客栈","entities":[
+        {"ref":"c_visitor","type":"character","name":"乙","aliases":[],"description":"旅人","life_status":"alive","location":"k1","owner":null}
+    ],"relations":[],"events":[],"open_threads":[]});
+    assert!(validator.is_valid(&reply));
+    let snapshot=super::decode_graph(reply.clone(),&text,&known.nodes,"ai_original").unwrap();
+    assert_eq!(snapshot.nodes[0].location.as_deref(),Some(known.nodes[1].key.as_str()));
+    reply["entities"][0]["location"]=json!("k0");
+    assert!(!validator.is_valid(&reply),"人物注册表引用不可充当地点");
+    reply["entities"][0]["location"]=json!("c_visitor");
+    assert!(!validator.is_valid(&reply),"新人物引用不可充当地点");
+    reply["entities"][0]["location"]=json!("l_inn");
+    reply["entities"].as_array_mut().unwrap().push(json!({"ref":"l_inn","type":"location","name":"新客栈","aliases":[],"description":"地点","life_status":null,"location":null,"owner":null}));
+    assert!(validator.is_valid(&reply));
+    assert!(super::decode_graph(reply,&text,&known.nodes,"ai_original").is_ok());
 }
 
 #[test]
