@@ -248,9 +248,11 @@ impl DuckDuckGoClient {
 
 fn ddg_result_url(href: &str) -> Option<String> {
     let href = href.replace("&amp;", "&");
-    let destination = if href.starts_with("//duckduckgo.com/l/?") {
-        Url::parse(&format!("https:{href}")).ok()?.query_pairs()
-            .find(|(key, _)| key == "uddg")?.1.into_owned()
+    let absolute = if href.starts_with("//") { std::borrow::Cow::Owned(format!("https:{href}")) }
+        else { std::borrow::Cow::Borrowed(href.as_str()) };
+    let parsed = Url::parse(&absolute).ok()?;
+    let destination = if parsed.host_str() == Some("duckduckgo.com") && parsed.path() == "/l/" {
+        parsed.query_pairs().find(|(key, _)| key == "uddg")?.1.into_owned()
     } else { href };
     is_public_http_url(&destination).then_some(destination)
 }
@@ -264,34 +266,50 @@ fn ddg_plain_text(html: &str, max: usize) -> String {
 
 fn parse_ddg_html(html: &str) -> Result<Vec<SearchResult>, DdgError> {
     if html.contains("anomaly") && html.contains("duckduckgo.com") { return Err(DdgError::RateLimited); }
-    // DDG's HTML endpoint exposes results as anchors. Cache the small patterns;
-    // attribute order and extra class names do not affect extraction.
-    static ANCHORS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<a\b([^>]*)>(.*?)</a\s*>").unwrap());
+    // Scan opening tags rather than whole elements so surrounding result divs
+    // cannot swallow title anchors. Snippets may use any element, without href.
+    static TAGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<(/?)([a-z][a-z0-9]*)\b([^>]*)>").unwrap());
     static ATTRIBUTES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)\b(class|href)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
     let mut results: Vec<SearchResult> = Vec::new();
     let mut current = None;
-    for anchor in ANCHORS.captures_iter(html) {
+    for tag in TAGS.captures_iter(html) {
+        if !tag[1].is_empty() { continue; }
         let mut class = "";
         let mut href = "";
-        for attribute in ATTRIBUTES.captures_iter(&anchor[1]) {
+        for attribute in ATTRIBUTES.captures_iter(&tag[3]) {
             let value = attribute.get(2).or_else(|| attribute.get(3)).unwrap().as_str();
             if attribute[1].eq_ignore_ascii_case("class") { class = value; }
             else { href = value; }
         }
-        if class.split_ascii_whitespace().any(|class| class == "result__a") {
+        let is_title = tag[2].eq_ignore_ascii_case("a") && class.split_ascii_whitespace().any(|class| class == "result__a");
+        let is_snippet = class.split_ascii_whitespace().any(|class| class == "result__snippet");
+        if !is_title && !is_snippet { continue; }
+        if is_title {
             if results.len() == MAX_RESULTS { break; }
             current = None;
+        }
+        // Find the matching close, including nested elements of the same kind.
+        let remainder = &html[tag.get(0).unwrap().end()..];
+        let mut depth = 1;
+        let mut text = None;
+        for closing in TAGS.captures_iter(remainder) {
+            if !closing[2].eq_ignore_ascii_case(&tag[2]) { continue; }
+            if closing[1].is_empty() {
+                if !closing[3].trim_end().ends_with('/') { depth += 1; }
+            } else {
+                depth -= 1;
+                if depth == 0 { text = Some(&remainder[..closing.get(0).unwrap().start()]); break; }
+            }
+        }
+        let Some(text) = text else { continue; };
+        if is_title {
             if let Some(url) = ddg_result_url(href) {
                 current = Some(results.len());
-                results.push(SearchResult { title: ddg_plain_text(&anchor[2], 300), url,
+                results.push(SearchResult { title: ddg_plain_text(text, 300), url,
                     content: String::new(), raw_content: None, score: None });
             }
-        } else if class.split_ascii_whitespace().any(|class| class == "result__snippet") {
-            if let Some(index) = current {
-                if ddg_result_url(href).as_deref() == Some(results[index].url.as_str()) {
-                    results[index].content = ddg_plain_text(&anchor[2], MAX_CANDIDATE_CHARS);
-                }
-            }
+        } else if let Some(index) = current {
+            results[index].content = ddg_plain_text(text, MAX_CANDIDATE_CHARS);
         }
     }
     Ok(results)
@@ -771,6 +789,37 @@ mod tests {
         assert_eq!(results[0].content, "第一章 雨夜 & 剧情");
         assert_eq!(results[0].raw_content, None);
         assert_eq!(results[0].score, None);
+    }
+
+    #[test]
+    fn ddg_parse_unwraps_absolute_redirect_and_guards_destination() {
+        let html = r#"<a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fpublic.example%2Fbook%3Fa%3D1%26b%3D2&amp;rut=ignored">书</a>
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=http%3A%2F%2F127.0.0.1%2Fbook">私网</a>
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=%2Frelative">相对</a>
+            <a class="result__a" href="https://duckduckgo.com/l/?rut=missing">无目标</a>"#;
+        let results = parse_ddg_html(html).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://public.example/book?a=1&b=2");
+    }
+
+    #[test]
+    fn ddg_parse_associates_non_anchor_and_unresolvable_snippets_with_previous_title() {
+        let html = r#"<div class="result"><a class="result__a" href="https://public.example/one">第一本</a>
+            <div class="result__snippet">第一章 <b>雨夜</b> &amp; 剧情</div></div>
+            <a class="result__a" href="https://public.example/two">第二本</a>
+            <a class="result__snippet">第二章 <span>黎明</span></a>
+            <a class="result__a" href="https://public.example/three">第三本</a>
+            <a class="result__snippet" href="/unresolvable">第三章 <b>旅途</b></a>
+            <a class="result__a" href="https://public.example/four">第四本</a>
+            <span class="result__snippet">第四章 <i>归来</i></span>
+            <a class="result__a" href="/invalid">无效标题</a>
+            <div class="result__snippet">不得关联第四本</div>"#;
+        let results = parse_ddg_html(html).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].content, "第一章 雨夜 & 剧情");
+        assert_eq!(results[1].content, "第二章 黎明");
+        assert_eq!(results[2].content, "第三章 旅途");
+        assert_eq!(results[3].content, "第四章 归来");
     }
 
     #[test]
