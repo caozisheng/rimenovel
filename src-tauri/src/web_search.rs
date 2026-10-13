@@ -254,7 +254,17 @@ impl DuckDuckGoClient {
     /// Fetch only a bounded public candidate page; errors never expose its URL or body.
     pub async fn fetch_page_text(&self, url: &str) -> Result<String, DdgError> {
         if !is_public_http_url(url) { return Err(DdgError::Unavailable); }
-        let mut response = self.http.get(url)
+        let parsed = Url::parse(url).map_err(|_| DdgError::Unavailable)?;
+        // reqwest reexports Url but not Host. Its serialized IPv6 host keeps
+        // brackets, so inspect that literal explicitly at the fetch boundary.
+        if let Some(host) = parsed.host_str().and_then(|host| host.strip_prefix('[')?.strip_suffix(']')) {
+            let ip = host.parse::<std::net::Ipv6Addr>().map_err(|_| DdgError::Unavailable)?;
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
+                || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()) {
+                return Err(DdgError::Unavailable);
+            }
+        }
+        let mut response = self.http.get(parsed)
             .timeout(Duration::from_secs(10))
             .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .send().await.map_err(|_| DdgError::Unavailable)?;
@@ -966,6 +976,21 @@ mod tests {
             "http://192.168.1.2/book".into(), "http://localhost/book".into(), "/relative".into(),
             "not a URL".into(), "file:///book".into(), "https://user:secret@public.example/book".into()] {
             assert_eq!(client.fetch_page_text(&url).await, Err(DdgError::Unavailable));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_refuses_private_ipv6_literals_before_request() {
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let server = MockServer::builder().listener(listener).start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("IPV6_PRIVATE_SECRET"))
+            .mount(&server).await;
+        let client = ddg_page_client(&server);
+        assert_eq!(client.fetch_page_text(&server.uri()).await, Err(DdgError::Unavailable));
+        for url in ["http://[::]/", "http://[fc00::1]/", "http://[fe80::1]/", "http://[::ffff:127.0.0.1]/"] {
+            assert_eq!(client.fetch_page_text(url).await, Err(DdgError::Unavailable));
         }
         assert!(server.received_requests().await.unwrap().is_empty());
     }
