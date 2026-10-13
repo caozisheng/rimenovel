@@ -300,9 +300,12 @@ fn ddg_plain_text(html: &str, max: usize) -> String {
 
 /// Minimal HTML conversion for chapter matching, not a DOM or layout parser.
 fn html_to_text(html: &str) -> String {
-    static HIDDEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
-        r"(?is)<!--.*?(?:-->|$)|<script\b[^>]*>.*?(?:</script\s*>|$)|<style\b[^>]*>.*?(?:</style\s*>|$)|<noscript\b[^>]*>.*?(?:</noscript\s*>|$)"
-    ).unwrap());
+    static HIDDEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(concat!(
+        r"(?is)<!--.*?(?:-->|$)|",
+        r#"<script\b(?:"[^"]*"|'[^']*'|[^'">])*>.*?(?:</script\s*>|$)|"#,
+        r#"<style\b(?:"[^"]*"|'[^']*'|[^'">])*>.*?(?:</style\s*>|$)|"#,
+        r#"<noscript\b(?:"[^"]*"|'[^']*'|[^'">])*>.*?(?:</noscript\s*>|$)"#,
+    )).unwrap());
     static TAGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
         r#"(?is)<\s*/?\s*([a-z][a-z0-9]*)\b(?:"[^"]*"|'[^']*'|[^'">])*>|<[^>]*>"#
     ).unwrap());
@@ -891,6 +894,16 @@ mod tests {
     fn html_to_text_strips_scripts_styles_and_noscript_content() {
         let html = "<STYLE>.x{content:'<p>hidden</p>'}</STYLE><script>var a=\"<p>hidden\";</script><p>第一章&nbsp;雨夜</p><noscript><p>hidden fallback</p></noscript><p>林昭推门。</p>";
         assert_eq!(html_to_text(html), "第一章 雨夜\n林昭推门。");
+    }
+
+    #[test]
+    fn html_to_text_hidden_openings_respect_quoted_attribute_boundaries() {
+        for tag in ["script", "style", "noscript"] {
+            for quote in ['\'', '"'] {
+                let html = format!("<{tag} data-note={quote}> </{tag}>{quote}>HIDDEN_BODY</{tag}><p>可见正文</p>");
+                assert_eq!(html_to_text(&html), "可见正文");
+            }
+        }
     }
 
     #[test]
