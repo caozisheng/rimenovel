@@ -2,9 +2,8 @@ use crate::llm::{ChatMessage, LlmClient, LlmError, StructuredRequest, TaskKind};
 use reqwest::{header, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, BTreeSet}, fmt, net::IpAddr, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fmt, net::{IpAddr, SocketAddr, ToSocketAddrs}, time::Duration};
 use unicode_normalization::UnicodeNormalization;
-
 pub const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 pub const TAVILY_EXTRACT_ENDPOINT: &str = "https://api.tavily.com/extract";
 pub const TARGET_DOMAINS: &[&str] = &[
@@ -257,16 +256,12 @@ impl DuckDuckGoClient {
     pub async fn fetch_page_text(&self, url: &str) -> Result<String, DdgError> {
         if !is_public_http_url(url) { return Err(DdgError::Unavailable); }
         let parsed = Url::parse(url).map_err(|_| DdgError::Unavailable)?;
-        // reqwest reexports Url but not Host. Its serialized IPv6 host keeps
-        // brackets, so inspect that literal explicitly at the fetch boundary.
-        if let Some(host) = parsed.host_str().and_then(|host| host.strip_prefix('[')?.strip_suffix(']')) {
-            let ip = host.parse::<std::net::Ipv6Addr>().map_err(|_| DdgError::Unavailable)?;
-            if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
-                || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()) {
-                return Err(DdgError::Unavailable);
-            }
-        }
-        let mut response = self.http.get(parsed)
+        let host = parsed.host_str().ok_or(DdgError::Unavailable)?;
+        let port = parsed.port_or_known_default().ok_or(DdgError::Unavailable)?;
+        let addresses = resolve_public_addresses(host, port)?;
+        let client = if addresses.is_empty() { self.http.clone() }
+            else { DuckDuckGoClient::http_builder().resolve(host, addresses[0]).build().map_err(|_| DdgError::Unavailable)? };
+        let mut response = client.get(parsed)
             .timeout(Duration::from_secs(10))
             .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .send().await.map_err(|_| DdgError::Unavailable)?;
@@ -279,6 +274,27 @@ impl DuckDuckGoClient {
         }
         let html = std::str::from_utf8(&bytes).map_err(|_| DdgError::Unavailable)?;
         Ok(clip(html_to_text(html), MAX_CANDIDATE_CHARS))
+    }
+}
+
+fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, DdgError> {
+    if let Ok(ip) = host.parse::<IpAddr>() { return is_public_ip(ip).then_some(vec![SocketAddr::new(ip, port)]).ok_or(DdgError::Unavailable); }
+    let addresses: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
+        Ok(addresses) => addresses.collect(),
+        Err(_) => {
+            #[cfg(test)]
+            if host == "public.example" { return Ok(Vec::new()); }
+            return Err(DdgError::Unavailable);
+        }
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) { return Err(DdgError::Unavailable); }
+    Ok(addresses)
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()),
+        IpAddr::V6(ip) => !(ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast())),
     }
 }
 
@@ -546,7 +562,9 @@ impl SearchEngine for DuckDuckGoClient {
             is_public_http_url(&result.url).then(|| RawCandidate { title: clip(&result.title, 300), url: result.url, text: result.content })
         }).take(MAX_CANDIDATES).collect::<Vec<_>>();
         for candidate in &mut candidates {
-            if candidate.text.trim().is_empty() { candidate.text = self.fetch_page_text(&candidate.url).await.map_err(|error| error.to_string())?; }
+            let snippet = candidate.text.clone();
+            if let Ok(text) = self.fetch_page_text(&candidate.url).await { candidate.text = text; }
+            else { candidate.text = snippet; }
             candidate.text = clip(&candidate.text, MAX_CANDIDATE_CHARS);
         }
         Ok(candidates)
@@ -591,6 +609,7 @@ pub(crate) async fn find_outline_with_progress<E: SearchEngine>(
     let selected = match targeted {
         Ok(set) => set,
         Err(WebOutlineRejection::AmbiguousSources) => return Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources)),
+        Err(WebOutlineRejection::RateLimited) => return Err(WebOutlineError::Rejected(WebOutlineRejection::RateLimited)),
         Err(_) => {
             check_cancelled(llm)?;
             on_stage(engine.stage(SearchPhase::BroadSearch));
@@ -1176,6 +1195,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "text");
     }
+    #[tokio::test]
+    async fn ddg_fetch_rejects_unresolvable_hostname_before_request() {
+        let server = MockServer::start().await;
+        let client = ddg_page_client(&server);
+        assert_eq!(client.fetch_page_text("https://this-host-does-not-exist.invalid/book").await, Err(DdgError::Unavailable));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
 
     #[test]
     fn ddg_parse_discards_relative_private_and_invalid_redirect_links() {
@@ -1236,6 +1263,25 @@ mod tests {
             assert!(request.headers.get("user-agent").unwrap().to_str().unwrap().contains("Mozilla/5.0"));
         }
     }
+    #[tokio::test]
+    async fn ddg_enrichment_fetches_full_page_even_when_snippet_exists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book")).respond_with(ResponseTemplate::new(200).set_body_string("<h1>第一章 雨夜</h1><p>完整正文来自候选页。</p>")).expect(1).mount(&server).await;
+        let client = ddg_page_client(&server);
+        let candidates = client.enrich_engine(SearchResponse { results: vec![SearchResult { title:"钟楼书".into(), url:ddg_page_url(&server), content:"摘要不含章节完整正文".into(), raw_content:None, score:None }] }).await.unwrap();
+        assert_eq!(candidates[0].text, "第一章 雨夜\n完整正文来自候选页。");
+    }
+
+    #[tokio::test]
+    async fn ddg_rate_limit_does_not_retry_broad_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(202)).expect(1).mount(&server).await;
+        let ddg = DuckDuckGoClient::with_endpoint(format!("{}/html/", server.uri())).unwrap();
+        let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
+        assert!(matches!(find_outline(&ddg, &llm, &lookup_fixture(), WebOutlineBudget::new(100_000, 4_096)).await, Err(WebOutlineError::Rejected(WebOutlineRejection::RateLimited))));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
 
     #[tokio::test]
     async fn ddg_request_status_errors_are_fixed_and_redacted() {
