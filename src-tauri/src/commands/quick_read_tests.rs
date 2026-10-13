@@ -1,9 +1,10 @@
 //! Offline worker acceptance: no credentials, external HTTP, or paid latency claims.
 use super::*;
 use crate::core::kg::RuntimeConfig;
-use crate::llm::{LlmClient,LlmError,StructuredResponse,TextRequest};
+use crate::llm::{LlmClient,LlmError,StructuredRequest,StructuredResponse,TextRequest};
 use crate::store::{books::{create_book_with_chapters,NewChapter},Db};
 use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+use wiremock::{matchers::{method,path},Mock,MockServer,ResponseTemplate};
 
 struct OfflineClient {
  control:crate::llm::policy::CallControl,
@@ -43,6 +44,77 @@ impl LlmClient for OfflineClient {
  fn commit_guard(&self)->Result<Option<crate::llm::policy::CommitGuard<'_>>,LlmError>{self.control.commit_guard().map(Some)}
  async fn stream_text(&self,_:TextRequest,_:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,LlmError>{panic!("quick-read must not request prose")}
 }
+struct WebMatrixClient { verdict:&'static str, calls:AtomicUsize }
+#[async_trait::async_trait]
+impl LlmClient for WebMatrixClient {
+ async fn structured_with_usage(&self,request:StructuredRequest<'_>)->Result<StructuredResponse,LlmError>{
+  self.calls.fetch_add(1,Ordering::SeqCst);
+  let input:Value=serde_json::from_str(&request.messages[1].content).unwrap();
+  let url=input["sources"][0]["url"].as_str().unwrap();
+  let value=if request.schema_name=="web_edition_paragraph_v1" {
+   json!({"verdict":self.verdict,"source_url":url})
+  } else {
+   let chapter=&input["chapters"][0];
+   let evidence="林昭走进旧宅发现一封信。";
+   json!({"plot_summary":"林昭发现信件。","plot_source_url":url,"plot_evidence":evidence,"plot_chapter_indices":[1],"characters":[],"chapters":[{"index":chapter["index"],"heading":chapter["heading"],"summary":"林昭发现一封信。","source_url":url,"evidence":evidence}]})
+  };
+  Ok(StructuredResponse{value,usage:None})
+ }
+ async fn stream_text(&self,_:TextRequest,_:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,LlmError>{Err(LlmError::Config("unused".into()))}
+}
+fn web_lookup_fixture()->crate::web_search::OutlineLookup{
+ crate::web_search::OutlineLookup{book_title:"钟楼书".into(),author:None,chapters:vec![crate::web_search::LocalOutlineChapter{index:1,heading:"第一章 雨夜".into(),text:"林昭走进旧宅发现一封信。她决定继续调查城南钟楼的线索，这是足够长的本地首段正文。".into()}]}
+}
+fn web_candidate_text()->&'static str{"钟楼书\n第一章 雨夜\n林昭走进旧宅发现一封信。这里进一步叙述城南钟楼的线索，正文长度足以支持来源章节匹配。"}
+fn ddg_candidate_results(count:usize)->String{
+ (0..count).map(|index|format!("<a class='result__a' href='https://public.example/{index}'>钟楼书</a><a class='result__snippet'>{}</a>",web_candidate_text())).collect()
+}
+#[tokio::test]
+async fn ddg_ambiguous_sources_skip_tavily_and_fall_back_locally(){
+ let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(ddg_candidate_results(2))).expect(1).mount(&ddg_server).await;
+ Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&tavily_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
+ let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();let rejections=parking_lot::Mutex::new(Vec::new());
+ let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason))).await.unwrap();
+ assert!(result.is_none());assert_eq!(llm.calls.load(Ordering::SeqCst),0);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::AmbiguousSources);
+}
+
+#[tokio::test]
+async fn ddg_ai_different_skips_tavily_and_falls_back_locally(){
+ let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(ddg_candidate_results(1))).expect(1).mount(&ddg_server).await;
+ Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&tavily_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
+ let llm=WebMatrixClient{verdict:"different",calls:AtomicUsize::new(0)};let token=CancellationToken::new();let rejections=parking_lot::Mutex::new(Vec::new());
+ let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason))).await.unwrap();
+ assert!(result.is_none());assert_eq!(llm.calls.load(Ordering::SeqCst),1);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::EditionUnverified);
+}
+
+#[tokio::test]
+async fn ddg_infrastructure_failure_retries_tavily_successfully(){
+ let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(500)).expect(2).mount(&ddg_server).await;
+ Mock::given(method("POST")).and(path("/search")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[{"title":"钟楼书","url":"https://public.example/source","content":"","raw_content":web_candidate_text()}]}))).expect(1).mount(&tavily_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
+ let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();
+ let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await.unwrap();
+ assert!(result.is_some());assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);assert_eq!(tavily_server.received_requests().await.unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn web_layer_cancellation_is_terminal_before_any_engine_request(){
+ let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
+ let llm=OfflineClient::new();let token=CancellationToken::new();token.cancel();
+ assert!(matches!(find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await,Err(crate::web_search::WebOutlineError::Cancelled)));
+ assert_eq!(ddg_server.received_requests().await.unwrap().len(),0);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);
+}
+
 #[test]
 fn web_rejection_codes_include_engine_prefix_and_retry_only_infrastructure_failures(){
  assert_eq!(web_rejection_code("ddg",crate::web_search::WebOutlineRejection::RateLimited),"ddg_rate_limited");
@@ -50,6 +122,17 @@ fn web_rejection_codes_include_engine_prefix_and_retry_only_infrastructure_failu
  assert!(web_rejection_is_retryable(crate::web_search::WebOutlineRejection::EvidenceInsufficient));
  assert!(!web_rejection_is_retryable(crate::web_search::WebOutlineRejection::AmbiguousSources));
  assert!(!web_rejection_is_retryable(crate::web_search::WebOutlineRejection::EditionUnverified));
+}
+#[tokio::test]
+async fn web_layers_skip_tavily_without_key_after_ddg_infrastructure_failure(){
+ let ddg_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(500)).expect(2).mount(&ddg_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let lookup=crate::web_search::OutlineLookup{book_title:"钟楼书".into(),author:None,chapters:vec![crate::web_search::LocalOutlineChapter{index:1,heading:"第一章 雨夜".into(),text:"林昭在雨夜走进旧宅寻找钟楼的线索，这是足够长的本地首段正文。".into()}]};
+ let client=OfflineClient::new();let token=CancellationToken::new();
+ let result=find_web_outline_layers(Some(&ddg),None,&client,&lookup,crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await.unwrap();
+ assert!(result.is_none());
+ assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);
 }
 #[test]
 fn local_failure_classification_distinguishes_provider_from_output_errors(){

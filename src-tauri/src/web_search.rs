@@ -490,7 +490,7 @@ impl TavilyClient {
 }
 
 #[derive(Clone)]
-struct RawCandidate { title: String, url: String, text: String }
+pub(crate) struct RawCandidate { title: String, url: String, text: String }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebOutlineStage {
@@ -519,10 +519,10 @@ impl WebOutlineStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchPhase { TargetedSearch, BroadSearch, Match, Outline }
+pub(crate) enum SearchPhase { TargetedSearch, BroadSearch, Match, Outline }
 
 #[async_trait::async_trait]
-trait SearchEngine: Send + Sync {
+pub(crate) trait SearchEngine: Send + Sync {
     async fn search_engine(&self, query: &str, domains: Option<&[&str]>) -> Result<SearchResponse, WebOutlineRejection>;
     async fn enrich_engine(&self, response: SearchResponse) -> Result<Vec<RawCandidate>, String>;
     fn stage(&self, phase: SearchPhase) -> WebOutlineStage;
@@ -592,6 +592,7 @@ pub(crate) async fn find_outline_with_progress<E: SearchEngine>(
         Ok(set) => set,
         Err(WebOutlineRejection::AmbiguousSources) => return Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources)),
         Err(_) => {
+            check_cancelled(llm)?;
             on_stage(engine.stage(SearchPhase::BroadSearch));
             let broad = engine.search_engine(&query, None).await;
             check_cancelled(llm)?;
@@ -1324,6 +1325,24 @@ mod tests {
 
     fn good_raw() -> &'static str { "钟楼书\n第一章 雨夜 林昭推开旧宅木门看见没有署名的信城南钟楼将在子夜敲响这是足够长的第一章正文夜雨落在青石台阶上而林昭握紧信封向钟楼走去她在钟声里想起失踪多年的姐姐于是决定独自查明真相后来她沿着河岸穿过寂静的长街反复确认信封上的蜡印并记录每一处可疑痕迹直到东方泛白她仍在思考钟楼管理员留下的谜语她决定第二天带着钥匙回到旧宅继续调查。\n第二章 钟楼，林昭在钟楼发现钥匙。补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据RAW_PAGE_ONLY_TRAILER" }
     fn good_outline() -> Value { json!({"plot_summary":"林昭循信件调查钟楼。", "plot_source_url":"https://public.example/chapter-1", "plot_evidence":"第二章 钟楼，林昭在钟楼发现钥匙", "plot_chapter_indices":[2], "characters":[{"name":"林昭","baseline":"收到信件后调查钟楼。","source_url":"https://public.example/chapter-1","evidence":"林昭推开旧宅木门看见没有署名的信","chapter_indices":[1]}], "chapters":[{"index":1,"heading":"第一章 雨夜","summary":"林昭发现信件。","source_url":"https://public.example/chapter-1","evidence":"第一章 雨夜 林昭推开旧宅木门"},{"index":2,"heading":"第二章 钟楼","summary":"林昭在钟楼发现钥匙。","source_url":"https://public.example/chapter-1","evidence":"第二章 钟楼，林昭在钟楼发现钥匙"}]}) }
+    struct CancelBeforeBroad { checks: AtomicUsize }
+    #[async_trait::async_trait]
+    impl LlmClient for CancelBeforeBroad {
+        async fn structured_with_usage(&self, _: StructuredRequest<'_>) -> Result<StructuredResponse, LlmError> { unreachable!("no model request expected") }
+        fn check_cancelled(&self) -> Result<(), LlmError> { if self.checks.fetch_add(1, Ordering::SeqCst) >= 2 { Err(LlmError::Cancelled) } else { Ok(()) } }
+        async fn stream_text(&self, _: TextRequest, _: Arc<dyn for<'a> Fn(&'a str) + Send + Sync>) -> Result<String, LlmError> { unreachable!("no stream request expected") }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_targeted_enrichment_prevents_broad_search() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/search")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[]}))).mount(&server).await;
+        let tavily = TavilyClient::with_endpoint("tvly-test".into(), format!("{}/search", server.uri())).unwrap();
+        let llm = CancelBeforeBroad { checks: AtomicUsize::new(0) };
+        assert!(matches!(find_outline(&tavily, &llm, &lookup_fixture(), WebOutlineBudget::new(100_000, 4_096)).await, Err(WebOutlineError::Cancelled)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
 
     #[tokio::test]
     async fn ddg_ambiguous_candidates_are_terminal_without_broad_retry() {
