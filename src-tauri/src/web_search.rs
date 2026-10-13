@@ -195,9 +195,15 @@ impl std::error::Error for DdgError {}
 pub struct DuckDuckGoClient { http: Client, endpoint: String }
 
 impl DuckDuckGoClient {
+    fn http_builder() -> reqwest::ClientBuilder {
+        // Every GET must pass the public URL guard before any request is sent.
+        // Search uses a direct endpoint too; redirects fail closed for both.
+        Client::builder().connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(20)).redirect(reqwest::redirect::Policy::none())
+    }
+
     pub fn new() -> Result<Self, DdgError> {
-        let http = Client::builder().connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(20)).build().map_err(|_| DdgError::Unavailable)?;
+        let http = Self::http_builder().build().map_err(|_| DdgError::Unavailable)?;
         Ok(Self { http, endpoint: "https://html.duckduckgo.com/html/".into() })
     }
 
@@ -904,7 +910,7 @@ mod tests {
     // only inside this client's test transport to the loopback mock server.
     fn ddg_page_client(server: &MockServer) -> DuckDuckGoClient {
         DuckDuckGoClient {
-            http: Client::builder().no_proxy().resolve("public.example", *server.address()).build().unwrap(),
+            http: DuckDuckGoClient::http_builder().no_proxy().resolve("public.example", *server.address()).build().unwrap(),
             endpoint: format!("{}/html/", server.uri()),
         }
     }
@@ -935,6 +941,21 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(format!("<p>{}</p>", "章".repeat(MAX_CANDIDATE_CHARS + 1))))
             .expect(1).mount(&server).await;
         assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await.unwrap(), "章".repeat(MAX_CANDIDATE_CHARS));
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_refuses_redirects_before_contacting_private_destination() {
+        let public = MockServer::start().await;
+        let private = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", format!("{}/private", private.uri())))
+            .expect(1).mount(&public).await;
+        Mock::given(method("GET")).and(path("/private"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("PRIVATE_PAGE_SECRET"))
+            .mount(&private).await;
+        let result = ddg_page_client(&public).fetch_page_text(&ddg_page_url(&public)).await;
+        assert_eq!(result, Err(DdgError::Unavailable));
+        assert!(private.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
