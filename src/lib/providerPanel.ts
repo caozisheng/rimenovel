@@ -14,6 +14,7 @@ const emptyForm = {
   api_key: "",
   context_limit: 32768,
   output_reserve: 4096,
+  // Persisted name is shared with the backend: this toggles all online search, not just Tavily.
   tavily_enabled: false,
   tavily_api_key: "",
 };
