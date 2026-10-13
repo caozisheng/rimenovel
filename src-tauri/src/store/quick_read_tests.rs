@@ -105,9 +105,10 @@ fn ai_proof(reference:&QuickReadReference,chapter_index:usize)->crate::web_searc
 #[test]
 fn web_reference_is_zero_slice_and_never_exposes_local_spans(){
  let (conn,book,sources)=fixture();let reference=web_ready(&sources);let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map,&reference).unwrap();
+ let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map,&reference).unwrap();
  assert_eq!(conn.query_row("SELECT total_chars,completed_chars,total_slices,completed_slices FROM quick_read_revisions WHERE id=?1",[revision],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap(),(0,0,0,0));
  assert_eq!(conn.query_row("SELECT proof_kind,proof_chapter_idx,match_score FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<f64>>(2)?))).unwrap(),("ai_paragraph".into(),2,None));
+ assert_eq!(conn.query_row("SELECT search_engine FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|row.get::<_,String>(0)).unwrap(),"tavily");
  assert!(conn.execute("UPDATE quick_read_web_outlines SET match_score=0.99 WHERE revision_id=?1",[revision]).is_err());
  assert!(conn.execute("UPDATE quick_read_web_outlines SET proof_kind='unverified' WHERE revision_id=?1",[revision]).is_err());
  assert!(conn.execute("UPDATE quick_read_web_outlines SET proof_chapter_idx=0 WHERE revision_id=?1",[revision]).is_err());
@@ -118,15 +119,15 @@ fn web_reference_is_zero_slice_and_never_exposes_local_spans(){
 #[test]
 fn web_publication_rejects_missing_provenance_or_incomplete_chapters(){
  let (conn,book,sources)=fixture();let mut reference=web_ready(&sources);let proof=ai_proof(&reference,2);let map=vec![(1,"One".into(),"https://example.com/outline".into())];
- assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&reference).unwrap_err().contains("incomplete"));
+ assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&reference).unwrap_err().contains("incomplete"));
  reference.source_provenance.clear();let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&reference).unwrap_err().contains("provenance"));
+ assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&reference).unwrap_err().contains("provenance"));
 }
 
 #[test]
 fn source_change_stales_a_published_web_reference(){
  let (conn,book,sources)=fixture();let reference=web_ready(&sources);let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map,&reference).unwrap();
+ publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map,&reference).unwrap();
  conn.execute("INSERT INTO chapters(book_id,idx,title,original_text,token_est) VALUES (?1,3,'Three','new source chapter',3)",[book]).unwrap();assert!(active_reference(&conn,book).unwrap().is_none());
 }
 
@@ -135,7 +136,7 @@ fn local_fallback_revives_matching_checkpoints_after_web_reference(){
  let (conn,book,sources)=fixture();let dependency="local-reader-v1";let revision=prepare_revision(&conn,book,&sources,dependency,1,"reader","v1","v1",&plan(&sources)).unwrap();
  save_slice(&conn,revision,&slice(0,&sources[0]),(10,10)).unwrap();
  let reference=web_ready(&sources);let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map,&reference).unwrap();
+ publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map,&reference).unwrap();
  let revived=prepare_revision(&conn,book,&sources,dependency,1,"reader","v1","v1",&plan(&sources)).unwrap();
  assert_eq!(revived,revision);assert_eq!(load_slices(&conn,revived).unwrap(),vec![slice(0,&sources[0])]);assert_eq!(pending_slices(&conn,revived).unwrap(),vec![1]);
 }
@@ -143,14 +144,14 @@ fn local_fallback_revives_matching_checkpoints_after_web_reference(){
 #[test]
 fn invalid_edition_proof_cannot_replace_active_reference(){
  let (conn,book,sources)=fixture();let reference=web_ready(&sources);let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map,&reference).unwrap();
+ let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map,&reference).unwrap();
  let mut proof=ai_proof(&reference,2);proof.method=crate::web_search::EditionProofMethod::TextSimilarity;
- assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&reference).is_err());
- proof=ai_proof(&reference,3);assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&reference).is_err());
- proof=ai_proof(&reference,2);proof.provenance.url="https://example.com/unaccepted".into();assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&reference).is_err());
+ assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&reference).is_err());
+ proof=ai_proof(&reference,3);assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&reference).is_err());
+ proof=ai_proof(&reference,2);proof.provenance.url="https://example.com/unaccepted".into();assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&reference).is_err());
  let mut mismatched_reference=reference.clone();mismatched_reference.source_provenance.push(proof.provenance.clone());
- assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency",&map,&mismatched_reference).is_err());
- assert!(publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map[..1],&reference).is_err());
+ assert!(publish_web_reference(&conn,book,"QuickRead",&proof,"web-dependency","tavily",&map,&mismatched_reference).is_err());
+ assert!(publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map[..1],&reference).is_err());
  assert_eq!(active_reference(&conn,book).unwrap(),Some(reference));
  assert_eq!(conn.query_row("SELECT id FROM quick_read_revisions WHERE book_id=?1 AND active=1",[book],|row|row.get::<_,i64>(0)).unwrap(),revision);
 }
@@ -158,7 +159,7 @@ fn invalid_edition_proof_cannot_replace_active_reference(){
 #[test]
 fn ai_proof_with_fake_numeric_score_or_unmapped_chapter_is_not_qualified(){
  let (conn,book,sources)=fixture();let reference=web_ready(&sources);let map=vec![(1,"One".into(),"https://example.com/outline".into()),(2,"Two".into(),"https://example.com/outline".into())];
- let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency",&map,&reference).unwrap();
+ let revision=publish_web_reference(&conn,book,"QuickRead",&ai_proof(&reference,2),"web-dependency","tavily",&map,&reference).unwrap();
  conn.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
  conn.execute("UPDATE quick_read_web_outlines SET match_score=1.0 WHERE revision_id=?1",[revision]).unwrap();assert!(active_reference(&conn,book).is_err());
  conn.execute("UPDATE quick_read_web_outlines SET match_score=NULL,proof_chapter_idx=3 WHERE revision_id=?1",[revision]).unwrap();assert!(active_reference(&conn,book).unwrap().is_none());

@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, include_str!("../../../migrations/0007_tavily_provider.sql")),
     (8, include_str!("../../../migrations/0008_web_outline.sql")),
     (9, include_str!("../../../migrations/0009_web_edition_proof.sql")),
+    (10, include_str!("../../../migrations/0010_web_outline_engine.sql")),
 ];
 #[cfg(test)]
 mod tavily_migration_tests {
@@ -213,7 +214,7 @@ mod web_edition_proof_migration_tests {
         for score in [0.82,0.97] {
             let (conn,book,revision,reference)=legacy_ready_database(score);
             Db::new(&conn).migrate().unwrap();Db::new(&conn).migrate().unwrap();
-            assert_eq!(conn.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),9);
+            assert_eq!(conn.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),10);
             assert_eq!(quick_read::active_reference(&conn,book).unwrap(),Some(reference));
             assert_eq!(conn.query_row("SELECT revision_id,normalized_book_title,match_score,proof_kind,proof_chapter_idx,created_at FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<f64>>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?))).unwrap(),(revision,"Legacy web".into(),Some(score),"text_similarity".into(),1,"2026-01-02 03:04:05".into()));
             assert_eq!(conn.query_row("SELECT book_id,dependency_digest,provider_id,status,active FROM quick_read_revisions WHERE id=?1",[revision],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?))).unwrap(),(book,"legacy-dependency".into(),7,"ready".into(),1));
@@ -239,6 +240,18 @@ mod web_edition_proof_migration_tests {
         conn.execute("UPDATE quick_read_web_outlines SET proof_chapter_idx=1 WHERE revision_id=?1",[revision]).unwrap();
         conn.execute("DELETE FROM quick_read_web_outline_chapters WHERE revision_id=?1 AND chapter_idx=2",[revision]).unwrap();
         assert!(quick_read::active_reference(&conn,book).unwrap().is_none());
+    }
+
+    #[test]
+    fn engine_migration_backfills_tavily_default(){
+        let (conn,book,revision,reference)=legacy_ready_database(0.97);
+        conn.execute_batch(MIGRATIONS.iter().find(|(version,_)|*version==9).unwrap().1).unwrap();
+        conn.pragma_update(None,"user_version",9).unwrap();
+        Db::new(&conn).migrate().unwrap();Db::new(&conn).migrate().unwrap();
+        assert_eq!(conn.query_row("SELECT search_engine FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|row.get::<_,String>(0)).unwrap(),"tavily");
+        assert_eq!(conn.query_row("PRAGMA user_version",[],|row|row.get::<_,i64>(0)).unwrap(),10);
+        assert_eq!(quick_read::active_reference(&conn,book).unwrap(),Some(reference));
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|row|row.get::<_,i64>(0)).unwrap(),0);
     }
 }
 

@@ -203,11 +203,16 @@ pub fn active_reference(conn:&Connection,book:i64)->Result<Option<QuickReadRefer
         "local_full_text"=>{if total_slices<=0||completed_slices!=total_slices||completed_chars!=total_chars{return Ok(None);}let slices=load_slices(conn,revision)?;if slices.len()!=total_slices as usize{return Ok(None);}validate_quick_read_coverage(&sources,&slices)?;let chapter_summaries=crate::core::quick_read::canonical_chapter_summaries(&slices);let reference=QuickReadReference{schema_version,source_digest,source_kind:QuickReadSourceKind::LocalFullText,provider_id,model,prompt_version,chapter_summaries,characters,plot_summary,plot_notes,completed_spans:slices.iter().flat_map(|slice|slice.source_spans.clone()).collect(),source_provenance:vec![]};validate_reference_baseline(&sources,&reference)?;Ok(Some(reference))}
         "web_outline"=>{
             if total_chars!=0||completed_chars!=0||total_slices!=0||completed_slices!=0{return Ok(None);}
-            let Some((match_score,provenance_json,proof_kind,proof_chapter_idx)):Option<(Option<f64>,String,String,i64)>=conn.query_row("SELECT match_score,provenance_json,proof_kind,proof_chapter_idx FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(error)? else{return Ok(None)};
+            let Some((match_score,provenance_json,proof_kind,proof_chapter_idx,engine,stored)):Option<(Option<f64>,String,String,i64,String,String)>=conn.query_row("SELECT w.match_score,w.provenance_json,w.proof_kind,w.proof_chapter_idx,w.search_engine,r.dependency_digest FROM quick_read_web_outlines w JOIN quick_read_revisions r ON r.id=w.revision_id WHERE w.revision_id=?1",[revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(error)? else{return Ok(None)};
             validate_persisted_edition_proof(&proof_kind,proof_chapter_idx,match_score)?;
             let source_provenance:Vec<WebOutlineProvenance>=decode(&provenance_json)?;validate_web_provenance(&source_provenance)?;
             if !validate_persisted_web_map(conn,revision,book,&sources,&source_provenance,proof_chapter_idx)?{return Ok(None);}
             let chapter_summaries=load_exact_chapter_summaries(conn,revision,&sources)?;
+            // Legacy proof rows remain inspectable, but readiness only admits
+            // the current AI prompt. Current rows use their own producing engine.
+            if prompt_version=="web-outline/ai-paragraph-v1" {
+                if crate::commands::quick_read::web_outline_dependency(conn,provider_id,&engine).ok().flatten().as_deref()!=Some(stored.as_str()){return Ok(None);}
+            }
             let reference=QuickReadReference{schema_version,source_digest,source_kind:QuickReadSourceKind::WebOutline,provider_id,model,prompt_version,chapter_summaries,characters,plot_summary,plot_notes,completed_spans:vec![],source_provenance};validate_reference_baseline(&sources,&reference)?;Ok(Some(reference))
         }
         _=>Ok(None),
@@ -230,7 +235,7 @@ pub fn publish_reference(conn:&Connection,revision:i64,reference:&QuickReadRefer
     tx.commit().map_err(error)
 }
 
-pub fn publish_web_reference(conn:&Connection,book:i64,normalized_book_title:&str,proof:&EditionProof,dependency_digest:&str,chapter_map:&[(i64,String,String)],reference:&QuickReadReference)->Result<i64,String>{
+pub fn publish_web_reference(conn:&Connection,book:i64,normalized_book_title:&str,proof:&EditionProof,dependency_digest:&str,search_engine:&str,chapter_map:&[(i64,String,String)],reference:&QuickReadReference)->Result<i64,String>{
     if reference.source_kind!=QuickReadSourceKind::WebOutline||!reference.completed_spans.is_empty()||normalized_book_title.trim().is_empty(){return Err("web outline must not claim local text coverage".into());}
     let sources=source_chapters(conn,book)?;if sources.is_empty()||source_digest(&sources)!=reference.source_digest{return Err("web outline source became stale".into());}
     validate_reference_baseline(&sources,reference)?;validate_web_provenance(&reference.source_provenance)?;
@@ -242,7 +247,7 @@ pub fn publish_web_reference(conn:&Connection,book:i64,normalized_book_title:&st
     if proof.method!=EditionProofMethod::AiParagraph||!reference.source_provenance.contains(&proof.provenance)||!chapter_map.iter().any(|(idx,_,url)|*idx==proof_chapter_idx&&url==&proof.provenance.url){return Err("web outline edition proof lacks an accepted mapped source".into());}
     let tx=conn.unchecked_transaction().map_err(error)?;tx.execute("UPDATE quick_read_revisions SET active=0,status='stale' WHERE book_id=?1 AND active=1",[book]).map_err(error)?;
     tx.execute("INSERT INTO quick_read_revisions(book_id,source_digest,dependency_digest,provider_id,model,prompt_version,schema_version,source_kind,total_chars,total_chapters,completed_chars,completed_slices,total_slices,status,active,plot_summary,plot_notes_json,characters_json) VALUES (?1,?2,?3,?4,?5,?6,?7,'web_outline',0,?8,0,0,0,'ready',1,?9,?10,?11)",params![book,reference.source_digest,dependency_digest,reference.provider_id,reference.model,reference.prompt_version,reference.schema_version,sources.len() as i64,reference.plot_summary,encode(&reference.plot_notes)?,encode(&reference.characters)?]).map_err(error)?;
-    let revision=tx.last_insert_rowid();tx.execute("INSERT INTO quick_read_web_outlines(revision_id,normalized_book_title,match_score,provenance_json,proof_kind,proof_chapter_idx) VALUES (?1,?2,NULL,?3,'ai_paragraph',?4)",params![revision,normalized_book_title,encode(&reference.source_provenance)?,proof_chapter_idx]).map_err(error)?;
+    let revision=tx.last_insert_rowid();tx.execute("INSERT INTO quick_read_web_outlines(revision_id,normalized_book_title,match_score,provenance_json,proof_kind,proof_chapter_idx,search_engine) VALUES (?1,?2,NULL,?3,'ai_paragraph',?4,?5)",params![revision,normalized_book_title,encode(&reference.source_provenance)?,proof_chapter_idx,search_engine]).map_err(error)?;
     for chapter in &reference.chapter_summaries {tx.execute("INSERT INTO quick_read_chapter_summaries(revision_id,chapter_idx,data_json) VALUES (?1,?2,?3)",params![revision,chapter.chapter_idx,encode(chapter)?]).map_err(error)?;}
     for (idx,heading,url) in chapter_map {tx.execute("INSERT INTO quick_read_web_outline_chapters(revision_id,chapter_idx,outline_heading,source_url) VALUES (?1,?2,?3,?4)",params![revision,idx,heading,url]).map_err(error)?;}
     tx.commit().map_err(error)?;Ok(revision)

@@ -121,7 +121,18 @@ async fn ddg_infrastructure_failure_retries_tavily_successfully(){
  let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
  let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();
  let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{}).await.unwrap();
- assert!(result.is_some());assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);assert_eq!(tavily_server.received_requests().await.unwrap().len(),1);
+ assert_eq!(result.unwrap().0,"tavily");assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);assert_eq!(tavily_server.received_requests().await.unwrap().len(),1);
+}
+
+#[tokio::test]
+async fn ddg_success_reports_producing_engine_without_tavily(){
+ let ddg_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(ddg_candidate_results(1))).expect(1).mount(&ddg_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();let local=AtomicUsize::new(0);
+ let result=find_web_outline_layers(Some(&ddg),None,&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{local.fetch_add(1,Ordering::SeqCst);}).await.unwrap().unwrap();
+ assert_eq!(result.0,"ddg");assert_eq!(result.1.edition_proof.method,crate::web_search::EditionProofMethod::AiParagraph);
+ assert_eq!(llm.calls.load(Ordering::SeqCst),2);assert_eq!(local.load(Ordering::SeqCst),0);
 }
 
 #[tokio::test]
@@ -322,7 +333,7 @@ fn changed_runtime_model_cannot_supersede_the_existing_active_reference(){
  conn.execute("INSERT INTO quick_read_revisions(book_id,source_digest,dependency_digest,provider_id,model,prompt_version,schema_version,source_kind,total_chars,total_chapters,total_slices,status,active) VALUES (?1,'old-source','old-dependency',?2,'reader','quick-read/v1','quick-read-summary/v1','local_full_text',6,1,1,'ready',1)",rusqlite::params![book,provider]).unwrap();let active=conn.last_insert_rowid();
  let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:"new-source".into(),source_kind:crate::core::quick_read::QuickReadSourceKind::WebOutline,provider_id:provider,model:"reader".into(),prompt_version:"web-outline/v1".into(),chapter_summaries:vec![],characters:vec![],plot_summary:"plot".into(),plot_notes:vec![],completed_spans:vec![],source_provenance:vec![]};
  let proof=crate::web_search::EditionProof{chapter_index:1,method:crate::web_search::EditionProofMethod::AiParagraph,provenance:crate::web_search::WebOutlineProvenance{url:"https://public.example/source".into(),title:"source".into(),evidence:"公开候选首段".into()}};
- conn.execute("UPDATE llm_providers SET model_extract='reader-v2' WHERE id=?1",[provider]).unwrap();assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","Guard",&proof,"old-dependency",&[],&reference).unwrap());
+ conn.execute("UPDATE llm_providers SET model_extract='reader-v2' WHERE id=?1",[provider]).unwrap();assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","Guard",&proof,"old-dependency","tavily",&[],&reference).unwrap());
  assert_eq!(conn.query_row("SELECT id FROM quick_read_revisions WHERE book_id=?1 AND active=1",[book],|row|row.get::<_,i64>(0)).unwrap(),active);
 }
 
@@ -337,7 +348,62 @@ fn explicit_nondefault_provider_can_publish_verified_web_reference() {
  let sources=repo::source_chapters(&conn,book).unwrap();
  let proof=crate::web_search::EditionProof{chapter_index:1,method:crate::web_search::EditionProofMethod::AiParagraph,provenance:crate::web_search::WebOutlineProvenance{url:"https://public.example/source".into(),title:"source".into(),evidence:"公开候选首段足够长".into()}};
  let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&sources),source_kind:crate::core::quick_read::QuickReadSourceKind::WebOutline,provider_id:selected,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:vec![crate::core::quick_read::ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![crate::core::quick_read::QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![crate::core::quick_read::QuickReadPlotNote{summary:"公开主线".into(),source_chapters:vec![1]}],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
- let dependency=web_outline_dependency(&conn,selected).unwrap().unwrap();
- assert!(publish_web_reference_if_current(&conn,book,selected,"reader","Guard",&proof,&dependency,&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
+ let dependency=web_outline_dependency(&conn,selected,"tavily").unwrap().unwrap();
+ assert!(publish_web_reference_if_current(&conn,book,selected,"reader","Guard",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
  assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference));
+}
+
+fn engine_reference_fixture(name:&str,with_tavily_key:bool)->(Connection,i64,i64,String,crate::web_search::EditionProof,crate::core::quick_read::QuickReadReference){
+ let conn=Connection::open_in_memory().unwrap();Db::apply_pragmas(&conn).unwrap();Db::new(&conn).migrate().unwrap();
+ let llm_key=format!("{name}-llm");let search_key=format!("{name}-search");crate::creds::save(&llm_key,"test-key").unwrap();
+ if with_tavily_key {crate::creds::save(&search_key,"original-tavily-key").unwrap();}
+ conn.execute("INSERT INTO llm_providers(name,protocol,base_url,key_ref,model_extract,model_merge,tavily_key_ref,params_json) VALUES (?1,'openai','https://example.test/v1',?2,'reader','writer',?3,'{\"tavily_enabled\":true}')",rusqlite::params![name,llm_key,with_tavily_key.then_some(&search_key)]).unwrap();let provider=conn.last_insert_rowid();
+ let book=create_book_with_chapters(&conn,name,None,"txt",name,&[NewChapter{idx:1,title:"One".into(),text:"source chapter".into(),token_est:4}]).unwrap();
+ let proof=crate::web_search::EditionProof{chapter_index:1,method:crate::web_search::EditionProofMethod::AiParagraph,provenance:crate::web_search::WebOutlineProvenance{url:"https://public.example/source".into(),title:"source".into(),evidence:"公开候选首段足够长".into()}};
+ let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&repo::source_chapters(&conn,book).unwrap()),source_kind:QuickReadSourceKind::WebOutline,provider_id:provider,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:vec![ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
+ (conn,book,provider,search_key,proof,reference)
+}
+
+#[test]
+fn ddg_outline_can_publish_without_tavily_key(){
+ let (conn,book,provider,_,proof,reference)=engine_reference_fixture("ddg-no-key",false);
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ assert_eq!(web_outline_dependency(&conn,provider,"ddg").unwrap(),Some(dependency.clone()));
+ assert!(web_outline_dependency(&conn,provider,"tavily").unwrap().is_none());
+ assert!(publish_web_reference_if_current(&conn,book,provider,"reader","ddg-no-key",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
+ assert_eq!(conn.query_row("SELECT search_engine FROM quick_read_web_outlines",[],|row|row.get::<_,String>(0)).unwrap(),"ddg");
+ assert!(web_reference_source_ready(&conn,book));assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference));
+}
+
+#[test]
+fn ddg_outline_stays_ready_across_tavily_key_rotation(){
+ let (conn,book,provider,key,proof,reference)=engine_reference_fixture("ddg-rotation",true);
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ assert_eq!(web_outline_dependency(&conn,provider,"ddg").unwrap(),Some(dependency.clone()));
+ assert!(publish_web_reference_if_current(&conn,book,provider,"reader","ddg-rotation",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
+ crate::creds::save(&key,"rotated-tavily-key").unwrap();
+ assert_eq!(web_outline_dependency(&conn,provider,"ddg").unwrap(),Some(dependency));
+ assert!(web_reference_source_ready(&conn,book));assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference));
+}
+
+#[test]
+fn tavily_outline_becomes_stale_after_key_rotation(){
+ let (conn,book,provider,key,proof,reference)=engine_reference_fixture("tavily-rotation",true);
+ let dependency=web_outline_dependency(&conn,provider,"tavily").unwrap().unwrap();
+ assert_eq!(dependency,crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{provider}:original-tavily-key").as_bytes()));
+ assert!(publish_web_reference_if_current(&conn,book,provider,"reader","tavily-rotation",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
+ assert!(web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_some());
+ crate::creds::save(&key,"rotated-tavily-key").unwrap();
+ assert!(!web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_none());
+ assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","tavily-rotation",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
+}
+
+#[test]
+fn ddg_outline_becomes_stale_when_web_search_is_disabled(){
+ let (conn,book,provider,_,proof,reference)=engine_reference_fixture("ddg-disabled",false);
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ repo::publish_web_reference(&conn,book,"ddg-disabled",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap();
+ conn.execute("UPDATE llm_providers SET params_json='{\"tavily_enabled\":false}' WHERE id=?1",[provider]).unwrap();
+ assert!(!web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_none());
+ assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","ddg-disabled",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
 }

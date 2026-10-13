@@ -77,11 +77,11 @@ async fn find_web_outline_layers(
     on_stage: &(dyn Fn(crate::web_search::WebOutlineStage) + Sync),
     on_rejection: &(dyn Fn(&str, crate::web_search::WebOutlineRejection) + Sync),
     on_local_fallback: &(dyn Fn() + Sync),
-) -> Result<Option<crate::web_search::VerifiedWebOutline>, crate::web_search::WebOutlineError> {
+) -> Result<Option<(&'static str, crate::web_search::VerifiedWebOutline)>, crate::web_search::WebOutlineError> {
     if let Some(engine) = ddg {
         if token.is_cancelled() { return Err(crate::web_search::WebOutlineError::Cancelled); }
         match crate::web_search::find_outline_with_progress(engine, llm, lookup, budget, on_stage).await {
-            Ok(Some(outline)) => return Ok(Some(outline)),
+            Ok(Some(outline)) => return Ok(Some(("ddg", outline))),
             Ok(None) => {},
             Err(crate::web_search::WebOutlineError::Cancelled) => return Err(crate::web_search::WebOutlineError::Cancelled),
             Err(crate::web_search::WebOutlineError::Rejected(reason)) => {
@@ -94,7 +94,7 @@ async fn find_web_outline_layers(
     if let Some(engine) = tavily {
         if token.is_cancelled() { return Err(crate::web_search::WebOutlineError::Cancelled); }
         match crate::web_search::find_outline_with_progress(engine, llm, lookup, budget, on_stage).await {
-            Ok(Some(outline)) => return Ok(Some(outline)),
+            Ok(Some(outline)) => return Ok(Some(("tavily", outline))),
             Ok(None) => {},
             Err(crate::web_search::WebOutlineError::Cancelled) => return Err(crate::web_search::WebOutlineError::Cancelled),
             Err(crate::web_search::WebOutlineError::Rejected(reason)) => {
@@ -129,24 +129,32 @@ fn outline_lookup(conn:&Connection,book:i64,texts:&[(i64,String)])->Result<crate
     Ok(crate::web_search::OutlineLookup{book_title:normalized_book_title(&title),author,chapters})
 }
 
-pub(crate) fn web_outline_dependency(conn:&Connection,provider:i64)->Result<Option<String>,String>{
-    providers::tavily_key(conn,provider).map(|key|key.map(|key|crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{provider}:{key}").as_bytes())))
+pub(crate) fn web_outline_dependency(conn:&Connection,provider:i64,engine:&str)->Result<Option<String>,String>{
+    match engine {
+        // DDG uses the web-search switch, never a Tavily credential.
+        "ddg"=>{
+            let enabled=conn.query_row("SELECT COALESCE(json_extract(params_json,'$.tavily_enabled'),0) FROM llm_providers WHERE id=?1",[provider],|row|row.get::<_,i64>(0)).map_err(error)?!=0;
+            Ok(enabled.then(||crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes())))
+        }
+        "tavily"=>providers::tavily_key(conn,provider).map(|key|key.map(|key|crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{provider}:{key}").as_bytes()))),
+        _=>Ok(None),
+    }
 }
 
 pub(crate) fn web_reference_source_ready(conn:&Connection,book:i64)->bool{
-    let row:Option<(i64,String)>=conn.query_row("SELECT provider_id,dependency_digest FROM quick_read_revisions WHERE book_id=?1 AND active=1 AND status='ready' AND source_kind='web_outline' AND prompt_version='web-outline/ai-paragraph-v1'",[book],|row|Ok((row.get(0)?,row.get(1)?))).optional().ok().flatten();
-    row.is_some_and(|(provider,stored)|web_outline_dependency(conn,provider).ok().flatten().as_deref()==Some(stored.as_str()))
+    let row:Option<(i64,String,String)>=conn.query_row("SELECT r.provider_id,r.dependency_digest,w.search_engine FROM quick_read_revisions r JOIN quick_read_web_outlines w ON w.revision_id=r.id WHERE r.book_id=?1 AND r.active=1 AND r.status='ready' AND r.source_kind='web_outline' AND r.prompt_version='web-outline/ai-paragraph-v1'",[book],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().ok().flatten();
+    row.is_some_and(|(provider,stored,engine)|web_outline_dependency(conn,provider,&engine).ok().flatten().as_deref()==Some(stored.as_str()))
 }
 
 fn local_fallback_config(conn:&Connection,selected_provider:i64)->Result<(crate::llm::ProviderConfig,crate::core::kg::RuntimeConfig),String>{
  super::kg::runtime_config(conn,Some(selected_provider)).map_err(|value|format!("not_configured: {value}"))
 }
 
-fn publish_web_reference_if_current(conn:&Connection,book:i64,expected_provider:i64,expected_model:&str,title:&str,proof:&crate::web_search::EditionProof,dependency:&str,chapter_map:&[(i64,String,String)],reference:&crate::core::quick_read::QuickReadReference)->Result<bool,String>{
+fn publish_web_reference_if_current(conn:&Connection,book:i64,expected_provider:i64,expected_model:&str,title:&str,proof:&crate::web_search::EditionProof,dependency:&str,engine:&str,chapter_map:&[(i64,String,String)],reference:&crate::core::quick_read::QuickReadReference)->Result<bool,String>{
     let current=super::kg::runtime_config(conn,Some(expected_provider)).ok();
-    let dependency_current=web_outline_dependency(conn,expected_provider).ok().flatten();
+    let dependency_current=web_outline_dependency(conn,expected_provider,engine).ok().flatten();
     if !current.as_ref().is_some_and(|(provider,config)|provider.id==expected_provider&&config.model_extract==expected_model)||dependency_current.as_deref()!=Some(dependency){return Ok(false);}
-    repo::publish_web_reference(conn,book,title,proof,dependency,chapter_map,reference)?;Ok(true)
+    repo::publish_web_reference(conn,book,title,proof,dependency,engine,chapter_map,reference)?;Ok(true)
 }
 fn notify(app:&tauri::AppHandle,id:i64) {
     let state=app.state::<AppState>();let guard=state.db.lock();let Some(conn)=guard.as_ref() else{return;};
@@ -332,10 +340,11 @@ async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option
    let (sources,texts)=sources_and_text(conn,book)?;
    let (cfg,config)=match super::kg::runtime_config(conn,provider_id){Ok(value)=>value,Err(e)=>return Err(format!("not_configured: {e}"))};
    let lookup=outline_lookup(conn,book,&texts)?;
-   let web_enabled:bool=conn.query_row("SELECT COALESCE(json_extract(params_json,'$.tavily_enabled'),0) FROM llm_providers WHERE id=?1",[cfg.id],|row|row.get::<_,i64>(0)).map_err(error)?!=0;
+   let ddg_dependency=web_outline_dependency(conn,cfg.id,"ddg")?;
+   let web_enabled=ddg_dependency.is_some();
    let tavily_key=providers::tavily_key(conn,cfg.id).ok().flatten();
-   let web_dependency=tavily_key.as_ref().map(|key|crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{}:{key}",cfg.id).as_bytes()));
-   (cfg,config,sources,texts,lookup,web_enabled,tavily_key,web_dependency)
+   let tavily_dependency=tavily_key.as_ref().map(|key|crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{}:{key}",cfg.id).as_bytes()));
+   (cfg,config,sources,texts,lookup,web_enabled,tavily_key,(ddg_dependency,tavily_dependency))
  };
  let (cached,web_source_ready)={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;(repo::active_reference(conn,book)?,web_reference_source_ready(conn,book))};
  if let Some(reference)=cached.filter(|reference|reference.source_digest==repo::source_digest(&sources)&&reference.provider_id==cfg.id&&reference.model==config.model_extract&&((reference.source_kind==QuickReadSourceKind::LocalFullText&&reference.prompt_version=="quick-read/v1")||(reference.source_kind==QuickReadSourceKind::WebOutline&&web_source_ready))) {
@@ -358,7 +367,7 @@ async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option
    Err(crate::web_search::WebOutlineError::Unavailable)=>on_rejection("web",crate::web_search::WebOutlineRejection::SearchUnavailable),
   }
  }
-  if let Some(outline)=outline {
+  if let Some((engine,outline))=outline {
    if token.is_cancelled(){return Err("请求已取消".into());}
    {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.8,&json!({"phase":"web_outline","stage":"quick_read","quick_read_source":"web_outline"})).map_err(error)?;}}notify(app,id);
    let cards=outline.characters.iter().enumerate().map(|(index,card)|{let source_chapters=card.source_chapters.iter().map(|chapter|*chapter as i64).collect::<Vec<_>>();QuickReadCharacterCard{id:format!("web-character-{index}"),name:card.name.clone(),aliases:vec![],identity_evidence:vec![card.baseline.clone()],motivations:vec![],narrative_roles:vec!["web_outline".into()],first_appearance_chapter:source_chapters[0],revelations:vec![],source_chapters}}).collect::<Vec<_>>();
@@ -366,7 +375,8 @@ async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option
    let plot_sources=outline.plot_chapters.iter().map(|chapter|*chapter as i64).collect::<Vec<_>>();
    let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&sources),source_kind:QuickReadSourceKind::WebOutline,provider_id:cfg.id,model:config.model_extract.clone(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:chapters,characters:cards,plot_summary:outline.plot_summary.clone(),plot_notes:vec![crate::core::quick_read::QuickReadPlotNote{summary:outline.plot_summary.clone(),source_chapters:plot_sources}],completed_spans:vec![],source_provenance:outline.provenance()};
    let chapter_map=outline.chapters.iter().map(|chapter|(chapter.index as i64,chapter.heading.clone(),chapter.provenance.url.clone())).collect::<Vec<_>>();
-   if let Some(dependency)=web_dependency {let published={let _guard=client.commit_guard().map_err(error)?;let guard=state.db.lock();publish_web_reference_if_current(guard.as_ref().ok_or("数据库未初始化")?,book,cfg.id,&config.model_extract,&lookup.book_title,&outline.edition_proof,&dependency,&chapter_map,&reference).unwrap_or(false)};if published {let bootstrap={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::set_progress(conn,id,1.0,&json!({"phase":"bootstrap_wiki","stage":"bootstrap_wiki","quick_read_source":"web_outline"})).map_err(error)?;ensure_bootstrap_job(conn,book,cfg.id,&reference.source_digest)?};if let Some(bootstrap_id)=bootstrap {launch_kind(app.clone(),book,bootstrap_id,Some(cfg.id),true);}return Ok(());}}
+   let dependency=if engine=="ddg" {web_dependency.0} else {web_dependency.1};
+   if let Some(dependency)=dependency {let published={let _guard=client.commit_guard().map_err(error)?;let guard=state.db.lock();publish_web_reference_if_current(guard.as_ref().ok_or("数据库未初始化")?,book,cfg.id,&config.model_extract,&lookup.book_title,&outline.edition_proof,&dependency,engine,&chapter_map,&reference).unwrap_or(false)};if published {let bootstrap={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::set_progress(conn,id,1.0,&json!({"phase":"bootstrap_wiki","stage":"bootstrap_wiki","quick_read_source":"web_outline"})).map_err(error)?;ensure_bootstrap_job(conn,book,cfg.id,&reference.source_digest)?};if let Some(bootstrap_id)=bootstrap {launch_kind(app.clone(),book,bootstrap_id,Some(cfg.id),true);}return Ok(());}}
   }
  {let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;mark_local_fallback_progress(conn,id)?;}notify(app,id);
  {let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;let (fresh_cfg,fresh_config)=local_fallback_config(conn,cfg.id)?;client=providers::make_client_with_control(fresh_cfg.clone(),control.clone())?;cfg=fresh_cfg;config=fresh_config;}
