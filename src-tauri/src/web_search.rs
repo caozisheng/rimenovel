@@ -2,7 +2,7 @@ use crate::llm::{ChatMessage, LlmClient, LlmError, StructuredRequest, TaskKind};
 use reqwest::{header, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, BTreeSet}, fmt, net::{IpAddr, SocketAddr, ToSocketAddrs}, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fmt, net::{IpAddr, SocketAddr, ToSocketAddrs}, sync::Arc, time::Duration};
 use unicode_normalization::UnicodeNormalization;
 pub const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 pub const TAVILY_EXTRACT_ENDPOINT: &str = "https://api.tavily.com/extract";
@@ -192,8 +192,8 @@ impl fmt::Display for DdgError {
 }
 impl std::error::Error for DdgError {}
 
-/// Best-effort HTML search without API keys, cookies or bearer credentials.
-pub struct DuckDuckGoClient { http: Client, endpoint: String, #[cfg(test)] resolved_fetch: Option<SocketAddr> }
+type DdgResolver = Arc<dyn Fn(&str, u16) -> Result<Vec<SocketAddr>, DdgError> + Send + Sync>;
+pub struct DuckDuckGoClient { http: Client, endpoint: String, resolver: DdgResolver, #[cfg(test)] transport_address: Option<SocketAddr> }
 
 impl DuckDuckGoClient {
     fn http_builder() -> reqwest::ClientBuilder {
@@ -205,7 +205,7 @@ impl DuckDuckGoClient {
 
     pub fn new() -> Result<Self, DdgError> {
         let http = Self::http_builder().build().map_err(|_| DdgError::Unavailable)?;
-        Ok(Self { http, endpoint: "https://html.duckduckgo.com/html/".into(), #[cfg(test)] resolved_fetch: None })
+        Ok(Self { http, endpoint: "https://html.duckduckgo.com/html/".into(), resolver: Arc::new(|host, port| resolve_public_addresses(host, port)), #[cfg(test)] transport_address: None })
     }
 
     #[cfg(test)]
@@ -260,7 +260,11 @@ impl DuckDuckGoClient {
         let port = parsed.port_or_known_default().ok_or(DdgError::Unavailable)?;
         let addresses = self.resolve_fetch_addresses(host, port).await?;
         let connect_host = host.trim_start_matches('[').trim_end_matches(']');
-        let client = DuckDuckGoClient::http_builder().no_proxy().resolve(connect_host, addresses[0]).build().map_err(|_| DdgError::Unavailable)?;
+        let pinned = {
+            #[cfg(test)] { self.transport_address.unwrap_or(addresses[0]) }
+            #[cfg(not(test))] { addresses[0] }
+        };
+        let client = DuckDuckGoClient::http_builder().no_proxy().resolve(connect_host, pinned).build().map_err(|_| DdgError::Unavailable)?;
         let mut response = client.get(parsed)
             .timeout(Duration::from_secs(10))
             .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -278,19 +282,23 @@ impl DuckDuckGoClient {
 }
 impl DuckDuckGoClient {
     async fn resolve_fetch_addresses(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, DdgError> {
-        #[cfg(test)]
-        if host == "public.example" { return self.resolved_fetch.map(|address| vec![address]).ok_or(DdgError::Unavailable); }
         let host = host.trim_start_matches('[').trim_end_matches(']').to_owned();
-        tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || resolve_public_addresses(&host, port)))
-            .await.map_err(|_| DdgError::Unavailable)?.map_err(|_| DdgError::Unavailable)?
+        let resolver = Arc::clone(&self.resolver);
+        tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || {
+            let addresses = (resolver)(&host, port)?;
+            validate_public_addresses(&addresses)
+        })).await.map_err(|_| DdgError::Unavailable)?.map_err(|_| DdgError::Unavailable)?
     }
 }
 
 fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, DdgError> {
-    if let Ok(ip) = host.parse::<IpAddr>() { return is_public_ip(ip).then_some(vec![SocketAddr::new(ip, port)]).ok_or(DdgError::Unavailable); }
+    if let Ok(ip) = host.parse::<IpAddr>() { return validate_public_addresses(&[SocketAddr::new(ip, port)]); }
     let addresses: Vec<SocketAddr> = (host, port).to_socket_addrs().map_err(|_| DdgError::Unavailable)?.collect();
+    validate_public_addresses(&addresses)
+}
+fn validate_public_addresses(addresses: &[SocketAddr]) -> Result<Vec<SocketAddr>, DdgError> {
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) { return Err(DdgError::Unavailable); }
-    Ok(addresses)
+    Ok(addresses.to_vec())
 }
 
 fn is_public_ip(ip: IpAddr) -> bool {
@@ -936,12 +944,11 @@ fn bibliographic_identity_matches(lookup: &OutlineLookup, candidate: &RawCandida
 }
 fn is_public_http_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else { return false; };
-    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return false; }
     let Some(host) = url.host_str() else { return false; };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") { return false; }
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()),
-        Ok(IpAddr::V6(ip)) => !(ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()),
+        Ok(ip) => is_public_ip(ip),
         Err(_) => true,
     }
 }
@@ -1021,12 +1028,43 @@ mod tests {
     // Keep production URL validation active: a public-looking host resolves
     // only inside this client's test transport to the loopback mock server.
     fn ddg_page_client(server: &MockServer) -> DuckDuckGoClient {
+        let transport = *server.address();
         DuckDuckGoClient {
-            http: DuckDuckGoClient::http_builder().no_proxy().resolve("public.example", *server.address()).build().unwrap(),
+            http: DuckDuckGoClient::http_builder().no_proxy().resolve("public.example", transport).build().unwrap(),
             endpoint: format!("{}/html/", server.uri()),
-            resolved_fetch: Some(*server.address()),
+            resolver: Arc::new(move |_, port| Ok(vec![SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)), port)])),
+            transport_address: Some(transport),
         }
     }
+    fn injected_ddg(resolver:DdgResolver, server:&MockServer) -> DuckDuckGoClient {
+        let transport=*server.address();
+        DuckDuckGoClient { http:DuckDuckGoClient::http_builder().no_proxy().resolve("public.example",transport).build().unwrap(), endpoint:format!("{}/html/",server.uri()), resolver, transport_address:Some(transport) }
+    }
+    #[tokio::test]
+    async fn injected_private_or_mixed_dns_results_are_rejected_before_connection() {
+        for addresses in [vec!["127.0.0.1:80".parse().unwrap()], vec!["93.184.216.34:80".parse().unwrap(),"10.0.0.1:80".parse().unwrap()]] {
+            let server=MockServer::start().await;
+            Mock::given(method("GET")).and(path("/book")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+            let client=injected_ddg(Arc::new(move |_,_|Ok(addresses.clone())),&server);
+            assert_eq!(client.resolve_fetch_addresses("public.example",80).await,Err(DdgError::Unavailable));
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn injected_all_public_dns_result_is_accepted_and_ipv6_brackets_are_normalized() {
+        let server=MockServer::start().await;
+        let seen=Arc::new(parking_lot::Mutex::new(String::new()));let capture=Arc::clone(&seen);
+        let client=injected_ddg(Arc::new(move |host,port|{*capture.lock()=host.to_owned();Ok(vec![SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(93,184,216,34)),port)])}),&server);
+        assert!(client.resolve_fetch_addresses("[2001:db8::42]",80).await.is_ok());
+        assert_eq!(seen.lock().as_str(),"2001:db8::42");
+    }
+    #[tokio::test]
+    async fn injected_dns_resolution_timeout_is_rejected() {
+        let server=MockServer::start().await;
+        let client=injected_ddg(Arc::new(|_,_|{std::thread::sleep(Duration::from_secs(6));Ok(vec!["93.184.216.34:80".parse().unwrap()])}),&server);
+        assert_eq!(client.resolve_fetch_addresses("public.example",80).await,Err(DdgError::Unavailable));
+    }
+
 
     fn ddg_page_url(server: &MockServer) -> String {
         format!("http://public.example:{}/book", server.address().port())
