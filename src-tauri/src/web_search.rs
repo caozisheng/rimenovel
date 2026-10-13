@@ -193,7 +193,7 @@ impl fmt::Display for DdgError {
 impl std::error::Error for DdgError {}
 
 /// Best-effort HTML search without API keys, cookies or bearer credentials.
-pub struct DuckDuckGoClient { http: Client, endpoint: String }
+pub struct DuckDuckGoClient { http: Client, endpoint: String, #[cfg(test)] resolved_fetch: Option<SocketAddr> }
 
 impl DuckDuckGoClient {
     fn http_builder() -> reqwest::ClientBuilder {
@@ -205,7 +205,7 @@ impl DuckDuckGoClient {
 
     pub fn new() -> Result<Self, DdgError> {
         let http = Self::http_builder().build().map_err(|_| DdgError::Unavailable)?;
-        Ok(Self { http, endpoint: "https://html.duckduckgo.com/html/".into() })
+        Ok(Self { http, endpoint: "https://html.duckduckgo.com/html/".into(), #[cfg(test)] resolved_fetch: None })
     }
 
     #[cfg(test)]
@@ -258,9 +258,9 @@ impl DuckDuckGoClient {
         let parsed = Url::parse(url).map_err(|_| DdgError::Unavailable)?;
         let host = parsed.host_str().ok_or(DdgError::Unavailable)?;
         let port = parsed.port_or_known_default().ok_or(DdgError::Unavailable)?;
-        let addresses = resolve_public_addresses(host, port)?;
-        let client = if addresses.is_empty() { self.http.clone() }
-            else { DuckDuckGoClient::http_builder().resolve(host, addresses[0]).build().map_err(|_| DdgError::Unavailable)? };
+        let addresses = self.resolve_fetch_addresses(host, port).await?;
+        let connect_host = host.trim_start_matches('[').trim_end_matches(']');
+        let client = DuckDuckGoClient::http_builder().no_proxy().resolve(connect_host, addresses[0]).build().map_err(|_| DdgError::Unavailable)?;
         let mut response = client.get(parsed)
             .timeout(Duration::from_secs(10))
             .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -276,17 +276,19 @@ impl DuckDuckGoClient {
         Ok(clip(html_to_text(html), MAX_CANDIDATE_CHARS))
     }
 }
+impl DuckDuckGoClient {
+    async fn resolve_fetch_addresses(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, DdgError> {
+        #[cfg(test)]
+        if host == "public.example" { return self.resolved_fetch.map(|address| vec![address]).ok_or(DdgError::Unavailable); }
+        let host = host.trim_start_matches('[').trim_end_matches(']').to_owned();
+        tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || resolve_public_addresses(&host, port)))
+            .await.map_err(|_| DdgError::Unavailable)?.map_err(|_| DdgError::Unavailable)?
+    }
+}
 
 fn resolve_public_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, DdgError> {
     if let Ok(ip) = host.parse::<IpAddr>() { return is_public_ip(ip).then_some(vec![SocketAddr::new(ip, port)]).ok_or(DdgError::Unavailable); }
-    let addresses: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
-        Ok(addresses) => addresses.collect(),
-        Err(_) => {
-            #[cfg(test)]
-            if host == "public.example" { return Ok(Vec::new()); }
-            return Err(DdgError::Unavailable);
-        }
-    };
+    let addresses: Vec<SocketAddr> = (host, port).to_socket_addrs().map_err(|_| DdgError::Unavailable)?.collect();
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) { return Err(DdgError::Unavailable); }
     Ok(addresses)
 }
@@ -1022,6 +1024,7 @@ mod tests {
         DuckDuckGoClient {
             http: DuckDuckGoClient::http_builder().no_proxy().resolve("public.example", *server.address()).build().unwrap(),
             endpoint: format!("{}/html/", server.uri()),
+            resolved_fetch: Some(*server.address()),
         }
     }
 
@@ -1203,6 +1206,13 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+
+    #[test]
+    fn public_ipv6_literal_passes_address_guard() {
+        assert!(is_public_ip("2001:db8::42".parse().unwrap()));
+        assert!(!is_public_ip("fc00::42".parse().unwrap()));
+        assert!(!is_public_ip("::1".parse().unwrap()));
+    }
 
     #[test]
     fn ddg_parse_discards_relative_private_and_invalid_redirect_links() {
