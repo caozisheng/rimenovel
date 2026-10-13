@@ -310,7 +310,7 @@ fn html_to_text(html: &str) -> String {
         r#"(?is)<\s*/?\s*([a-z][a-z0-9]*)\b(?:"[^"]*"|'[^']*'|[^'">])*>|<[^>]*>"#
     ).unwrap());
     static ENTITIES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
-        r"&(?:amp|lt|gt|quot|nbsp|#[0-9]+|#[xX][0-9a-fA-F]+);"
+        r"&(?:amp|lt|gt|quot|apos|nbsp|#[0-9]+|#[xX][0-9a-fA-F]+);"
     ).unwrap());
     const BLOCK_TAGS: &[&str] = &[
         "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
@@ -345,6 +345,7 @@ fn html_to_text(html: &str) -> String {
         let encoded = &entity.as_str()[1..entity.len() - 1];
         let decoded = match encoded {
             "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "nbsp" => Some(' '),
+            "apos" => Some('\''),
             _ => {
                 let number = encoded.strip_prefix('#').unwrap();
                 let (digits, radix) = match number.strip_prefix('x').or_else(|| number.strip_prefix('X')) {
@@ -910,6 +911,11 @@ mod tests {
     fn html_to_text_decodes_named_and_numeric_entities_after_tags() {
         assert_eq!(html_to_text("<p>&amp; &lt;p&gt; &quot; &#39; &nbsp; &#65; &#x4E2D; &#X1F600;</p>"), "& <p> \" ' A 中 😀");
         assert_eq!(html_to_text("&amp;lt; &unknown; &#xD800; &#99999999; &#oops;"), "&lt; &unknown; &#xD800; &#99999999; &#oops;");
+    }
+
+    #[test]
+    fn html_to_text_decodes_named_apostrophe_entity() {
+        assert_eq!(html_to_text("<p>it&apos;s</p>"), "it's");
     }
 
     #[test]
