@@ -146,7 +146,6 @@ fn save_provider(conn: &Connection, input: &ProviderInput) -> Result<i64, String
     let existing_tavily_key_ref: Option<String> = input.id.map(|id|tx.query_row("SELECT tavily_key_ref FROM llm_providers WHERE id=?1",[id],|row|row.get(0)).optional()).transpose().map_err(|e|e.to_string())?.flatten().flatten();
     let replace_tavily_key=!input.tavily_api_key.trim().is_empty();
     let tavily_key_ref=if replace_tavily_key {Some(existing_tavily_key_ref.unwrap_or_else(||format!("tavily-key-{:032x}",rand::random::<u128>())))} else {existing_tavily_key_ref};
-    if input.tavily_enabled.unwrap_or(false) && tavily_key_ref.is_none(){return Err("启用联网概要需要 Tavily API Key".into());}
     let duplicate: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM llm_providers WHERE name=?1 AND (?2 IS NULL OR id<>?2))",
         params![input.name, input.id], |r| r.get(0),
@@ -483,6 +482,9 @@ mod tests {
         let conn=db();let mut input=sample("web-provider");input.tavily_enabled=Some(false);input.tavily_api_key="tvly-private".into();
         let id=save_provider(&conn,&input).unwrap();
         assert!(tavily_key(&conn,id).unwrap().is_none());
+        let disabled = row_from(&conn, id).unwrap().unwrap();
+        assert!(!disabled.tavily_enabled);
+        assert!(disabled.has_tavily_key);
         let mut enable=sample("web-provider");enable.id=Some(id);enable.api_key.clear();enable.tavily_api_key.clear();enable.tavily_enabled=Some(true);
         assert!(save_provider(&conn,&enable).is_ok());
         let rows=list_providers(&conn).unwrap();
@@ -499,12 +501,31 @@ mod tests {
     }
 
     #[test]
-    fn enabling_tavily_without_key_does_not_modify_llm_provider(){
-        let conn=db();let id=save_provider(&conn,&sample("no-search-key")).unwrap();
-        let mut change=sample("no-search-key");change.id=Some(id);change.api_key.clear();change.tavily_enabled=Some(true);
-        assert!(save_provider(&conn,&change).is_err());
-        assert!(!list_providers(&conn).unwrap()[0].tavily_enabled);
-        assert_eq!(load_config(&conn,id).unwrap().api_key,"sk-test");
+    fn enabling_search_without_key_preserves_llm_provider() {
+        let conn = db();
+        let id = save_provider(&conn, &sample("no-search-key")).unwrap();
+        let mut change = sample("no-search-key");
+        change.id = Some(id);
+        change.api_key.clear();
+        change.tavily_enabled = Some(true);
+        assert_eq!(save_provider(&conn, &change).unwrap(), id);
+        let row = row_from(&conn, id).unwrap().unwrap();
+        assert!(row.tavily_enabled);
+        assert!(!row.has_tavily_key);
+        assert!(tavily_key(&conn, id).unwrap().is_none());
+        assert_eq!(load_config(&conn, id).unwrap().api_key, "sk-test");
+    }
+
+    #[test]
+    fn creating_provider_with_search_enabled_needs_no_tavily_key() {
+        let conn = db();
+        let mut input = sample("ddg-only-provider");
+        input.tavily_enabled = Some(true);
+        let id = save_provider(&conn, &input).unwrap();
+        let row = row_from(&conn, id).unwrap().unwrap();
+        assert!(row.tavily_enabled);
+        assert!(!row.has_tavily_key);
+        assert!(tavily_key(&conn, id).unwrap().is_none());
     }
 
     #[test]
