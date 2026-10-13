@@ -54,6 +54,18 @@ fn local_provider_error(error:crate::llm::LlmError)->String {
     let detail=if matches!(error,crate::llm::LlmError::Server{status:504,..}) {":Provider 返回 504"} else {""};
     format!("local_failure_kind:{kind}{detail}")
 }
+fn web_rejection_code(engine:&str, reason:crate::web_search::WebOutlineRejection)->String {
+    format!("{engine}_{}", match reason {
+        crate::web_search::WebOutlineRejection::RateLimited => "rate_limited",
+        crate::web_search::WebOutlineRejection::SearchUnavailable => "search_unavailable",
+        crate::web_search::WebOutlineRejection::EditionTextUnavailable => "edition_text_unavailable",
+        crate::web_search::WebOutlineRejection::EvidenceInsufficient => "evidence_insufficient",
+        other => other.as_str(),
+    })
+}
+fn web_rejection_is_retryable(reason:crate::web_search::WebOutlineRejection)->bool {
+    matches!(reason, crate::web_search::WebOutlineRejection::SearchUnavailable|crate::web_search::WebOutlineRejection::RateLimited|crate::web_search::WebOutlineRejection::EditionTextUnavailable|crate::web_search::WebOutlineRejection::EvidenceInsufficient)
+}
 
 fn normalized_book_title(title:&str)->String {
     let trimmed=title.trim();
@@ -275,13 +287,14 @@ fn launch_kind(app:tauri::AppHandle,book:i64,id:i64,provider:Option<i64>,bootstr
 
 async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option<i64>,token:&CancellationToken,control:crate::llm::policy::CallControl)->Result<(),String>{
  let state=app.state::<AppState>();
- let (mut cfg,mut config,sources,texts,lookup,tavily_key,web_dependency)={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::mark_running(conn,id).map_err(error)?;
+ let (mut cfg,mut config,sources,texts,lookup,web_enabled,tavily_key,web_dependency)={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::mark_running(conn,id).map_err(error)?;
    let (sources,texts)=sources_and_text(conn,book)?;
    let (cfg,config)=match super::kg::runtime_config(conn,provider_id){Ok(value)=>value,Err(e)=>return Err(format!("not_configured: {e}"))};
    let lookup=outline_lookup(conn,book,&texts)?;
+   let web_enabled:bool=conn.query_row("SELECT COALESCE(json_extract(params_json,'$.tavily_enabled'),0) FROM llm_providers WHERE id=?1",[cfg.id],|row|row.get::<_,i64>(0)).map_err(error)?!=0;
    let tavily_key=providers::tavily_key(conn,cfg.id).ok().flatten();
    let web_dependency=tavily_key.as_ref().map(|key|crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{}:{key}",cfg.id).as_bytes()));
-   (cfg,config,sources,texts,lookup,tavily_key,web_dependency)
+   (cfg,config,sources,texts,lookup,web_enabled,tavily_key,web_dependency)
  };
  let (cached,web_source_ready)={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;(repo::active_reference(conn,book)?,web_reference_source_ready(conn,book))};
  if let Some(reference)=cached.filter(|reference|reference.source_digest==repo::source_digest(&sources)&&reference.provider_id==cfg.id&&reference.model==config.model_extract&&((reference.source_kind==QuickReadSourceKind::LocalFullText&&reference.prompt_version=="quick-read/v1")||(reference.source_kind==QuickReadSourceKind::WebOutline&&web_source_ready))) {
@@ -289,20 +302,36 @@ async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option
  }
  let mut client=providers::make_client_with_control(cfg.clone(),control.clone())?;
  if token.is_cancelled(){return Err("请求已取消".into());}
- if let (Some(key),Some(dependency))=(tavily_key,web_dependency) {
+ let mut outline=None;
+ let mut terminal_rejection=None;
+ if web_enabled {
   {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.02,&json!({"phase":"web_search","stage":"quick_read"})).map_err(error)?;}}notify(app,id);
   let progress=|stage:crate::web_search::WebOutlineStage|{let guard=state.db.lock();if let Some(conn)=guard.as_ref(){let _=jobs::set_progress(conn,id,0.1,&json!({"phase":stage.as_str(),"stage":"quick_read"}));}drop(guard);notify(app,id);};
-  let mut web_rejection=None;
-  let outline=match crate::web_search::TavilyClient::new(key) {
-   Ok(tavily)=>match crate::web_search::find_outline_with_progress(&tavily,client.as_ref(),&lookup,crate::web_search::WebOutlineBudget::new(config.context_limit,config.output_reserve),&progress).await {
-    Ok(outline)=>outline,
+  let ddg=crate::web_search::DuckDuckGoClient::new().ok();
+  if let Some(ddg)=ddg {
+   if token.is_cancelled(){return Err("请求已取消".into());}
+   match crate::web_search::find_outline_with_progress(&ddg,client.as_ref(),&lookup,crate::web_search::WebOutlineBudget::new(config.context_limit,config.output_reserve),&progress).await {
+    Ok(value)=>outline=value,
     Err(crate::web_search::WebOutlineError::Cancelled)=>return Err("请求已取消".into()),
-    Err(crate::web_search::WebOutlineError::Rejected(reason))=>{web_rejection=Some(reason.as_str());None},
-    Err(crate::web_search::WebOutlineError::Unavailable)=>{web_rejection=Some("search_unavailable");None},
-   },
-   Err(_)=>{web_rejection=Some("search_unavailable");None},
-  };
-  if let Some(reason)=web_rejection {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.1,&json!({"web_rejection":reason})).map_err(error)?;}}
+    Err(crate::web_search::WebOutlineError::Rejected(reason)) if !web_rejection_is_retryable(reason)=>terminal_rejection=Some(web_rejection_code("ddg",reason)),
+    Err(crate::web_search::WebOutlineError::Rejected(reason))=>{let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.1,&json!({"web_rejection":web_rejection_code("ddg",reason)})).map_err(error)?;}},
+    Err(crate::web_search::WebOutlineError::Unavailable)=>{},
+   }
+  }
+  if outline.is_none() && terminal_rejection.is_none() {
+   if token.is_cancelled(){return Err("请求已取消".into());}
+   if let Some(key)=tavily_key {
+    let tavily=crate::web_search::TavilyClient::new(key).map_err(|_|"Tavily 客户端不可用".to_owned())?;
+    match crate::web_search::find_outline_with_progress(&tavily,client.as_ref(),&lookup,crate::web_search::WebOutlineBudget::new(config.context_limit,config.output_reserve),&progress).await {
+     Ok(value)=>outline=value,
+     Err(crate::web_search::WebOutlineError::Cancelled)=>return Err("请求已取消".into()),
+     Err(crate::web_search::WebOutlineError::Rejected(reason)) if !web_rejection_is_retryable(reason)=>terminal_rejection=Some(web_rejection_code("tavily",reason)),
+     Err(crate::web_search::WebOutlineError::Rejected(reason))=>{let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.1,&json!({"web_rejection":web_rejection_code("tavily",reason)})).map_err(error)?;}},
+     Err(crate::web_search::WebOutlineError::Unavailable)=>{},
+    }
+   }
+  }
+  if let Some(reason)=terminal_rejection {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.1,&json!({"web_rejection":reason})).map_err(error)?;}}
   if let Some(outline)=outline {
    if token.is_cancelled(){return Err("请求已取消".into());}
    {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.8,&json!({"phase":"web_outline","stage":"quick_read","quick_read_source":"web_outline"})).map_err(error)?;}}notify(app,id);
@@ -311,9 +340,7 @@ async fn run_quick_read(app:&tauri::AppHandle,book:i64,id:i64,provider_id:Option
    let plot_sources=outline.plot_chapters.iter().map(|chapter|*chapter as i64).collect::<Vec<_>>();
    let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&sources),source_kind:QuickReadSourceKind::WebOutline,provider_id:cfg.id,model:config.model_extract.clone(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:chapters,characters:cards,plot_summary:outline.plot_summary.clone(),plot_notes:vec![crate::core::quick_read::QuickReadPlotNote{summary:outline.plot_summary.clone(),source_chapters:plot_sources}],completed_spans:vec![],source_provenance:outline.provenance()};
    let chapter_map=outline.chapters.iter().map(|chapter|(chapter.index as i64,chapter.heading.clone(),chapter.provenance.url.clone())).collect::<Vec<_>>();
-   let published={let _guard=client.commit_guard().map_err(error)?;let guard=state.db.lock();publish_web_reference_if_current(guard.as_ref().ok_or("数据库未初始化")?,book,cfg.id,&config.model_extract,&lookup.book_title,&outline.edition_proof,&dependency,&chapter_map,&reference).unwrap_or(false)};
-   if published {let bootstrap={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::set_progress(conn,id,1.0,&json!({"phase":"bootstrap_wiki","stage":"bootstrap_wiki","quick_read_source":"web_outline"})).map_err(error)?;ensure_bootstrap_job(conn,book,cfg.id,&reference.source_digest)?};if let Some(bootstrap_id)=bootstrap {launch_kind(app.clone(),book,bootstrap_id,Some(cfg.id),true);}return Ok(());}
-   if token.is_cancelled(){return Err("请求已取消".into());}
+   if let Some(dependency)=web_dependency {let published={let _guard=client.commit_guard().map_err(error)?;let guard=state.db.lock();publish_web_reference_if_current(guard.as_ref().ok_or("数据库未初始化")?,book,cfg.id,&config.model_extract,&lookup.book_title,&outline.edition_proof,&dependency,&chapter_map,&reference).unwrap_or(false)};if published {let bootstrap={let guard=state.db.lock();let conn=guard.as_ref().ok_or("数据库未初始化")?;jobs::set_progress(conn,id,1.0,&json!({"phase":"bootstrap_wiki","stage":"bootstrap_wiki","quick_read_source":"web_outline"})).map_err(error)?;ensure_bootstrap_job(conn,book,cfg.id,&reference.source_digest)?};if let Some(bootstrap_id)=bootstrap {launch_kind(app.clone(),book,bootstrap_id,Some(cfg.id),true);}return Ok(());}}
   }
  }
  {let guard=state.db.lock();if let Some(conn)=guard.as_ref(){jobs::set_progress(conn,id,0.0,&json!({"phase":"local_fallback","stage":"quick_read","quick_read_source":"local_full_text"})).map_err(error)?;}}notify(app,id);

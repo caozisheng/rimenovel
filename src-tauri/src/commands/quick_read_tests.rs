@@ -44,6 +44,14 @@ impl LlmClient for OfflineClient {
  async fn stream_text(&self,_:TextRequest,_:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,LlmError>{panic!("quick-read must not request prose")}
 }
 #[test]
+fn web_rejection_codes_include_engine_prefix_and_retry_only_infrastructure_failures(){
+ assert_eq!(web_rejection_code("ddg",crate::web_search::WebOutlineRejection::RateLimited),"ddg_rate_limited");
+ assert_eq!(web_rejection_code("tavily",crate::web_search::WebOutlineRejection::SearchUnavailable),"tavily_search_unavailable");
+ assert!(web_rejection_is_retryable(crate::web_search::WebOutlineRejection::EvidenceInsufficient));
+ assert!(!web_rejection_is_retryable(crate::web_search::WebOutlineRejection::AmbiguousSources));
+ assert!(!web_rejection_is_retryable(crate::web_search::WebOutlineRejection::EditionUnverified));
+}
+#[test]
 fn local_failure_classification_distinguishes_provider_from_output_errors(){
  assert_eq!(local_failure_kind(&LlmError::Server{status:429,body:"secret body".into(),retry_after:None,request_id:None}),"rate_limited");
  assert_eq!(local_failure_kind(&LlmError::Server{status:504,body:"secret body".into(),retry_after:None,request_id:None}),"upstream_unavailable");

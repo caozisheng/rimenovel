@@ -121,6 +121,7 @@ impl VerifiedWebOutline {
 pub enum WebOutlineRejection {
     InvalidLookup,
     SearchUnavailable,
+    RateLimited,
     EditionTextUnavailable,
     EditionUnverified,
     EvidenceInsufficient,
@@ -135,6 +136,7 @@ impl WebOutlineRejection {
         match self {
             Self::InvalidLookup => "invalid_lookup",
             Self::SearchUnavailable => "search_unavailable",
+            Self::RateLimited => "rate_limited",
             Self::EditionTextUnavailable => "edition_text_unavailable",
             Self::EditionUnverified => "edition_unverified",
             Self::EvidenceInsufficient => "evidence_insufficient",
@@ -491,29 +493,85 @@ impl TavilyClient {
 struct RawCandidate { title: String, url: String, text: String }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebOutlineStage { TargetedSearch, BroadSearch, Match, Outline }
+pub enum WebOutlineStage {
+    TargetedSearch,
+    BroadSearch,
+    Match,
+    Outline,
+    DdgSearch,
+    DdgSearchBroad,
+    DdgMatch,
+    DdgOutline,
+}
 impl WebOutlineStage {
     pub const fn as_str(self) -> &'static str {
-        match self { Self::TargetedSearch => "web_search", Self::BroadSearch => "web_search_broad", Self::Match => "web_match", Self::Outline => "web_outline" }
+        match self {
+            Self::TargetedSearch => "web_search",
+            Self::BroadSearch => "web_search_broad",
+            Self::Match => "web_match",
+            Self::Outline => "web_outline",
+            Self::DdgSearch => "ddg_search",
+            Self::DdgSearchBroad => "ddg_search_broad",
+            Self::DdgMatch => "ddg_match",
+            Self::DdgOutline => "ddg_outline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchPhase { TargetedSearch, BroadSearch, Match, Outline }
+
+#[async_trait::async_trait]
+trait SearchEngine: Send + Sync {
+    async fn search_engine(&self, query: &str, domains: Option<&[&str]>) -> Result<SearchResponse, WebOutlineRejection>;
+    async fn enrich_engine(&self, response: SearchResponse) -> Result<Vec<RawCandidate>, String>;
+    fn stage(&self, phase: SearchPhase) -> WebOutlineStage;
+}
+#[async_trait::async_trait]
+impl SearchEngine for TavilyClient {
+    async fn search_engine(&self, query: &str, domains: Option<&[&str]>) -> Result<SearchResponse, WebOutlineRejection> { self.search(query, domains).await.map_err(|_| WebOutlineRejection::SearchUnavailable) }
+    async fn enrich_engine(&self, response: SearchResponse) -> Result<Vec<RawCandidate>, String> { enrich_candidates(self, response).await }
+    fn stage(&self, phase: SearchPhase) -> WebOutlineStage {
+        match phase { SearchPhase::TargetedSearch => WebOutlineStage::TargetedSearch, SearchPhase::BroadSearch => WebOutlineStage::BroadSearch, SearchPhase::Match => WebOutlineStage::Match, SearchPhase::Outline => WebOutlineStage::Outline }
+    }
+}
+
+#[async_trait::async_trait]
+impl SearchEngine for DuckDuckGoClient {
+    async fn search_engine(&self, query: &str, domains: Option<&[&str]>) -> Result<SearchResponse, WebOutlineRejection> {
+        self.search(query, domains).await.map_err(|error| match error { DdgError::RateLimited => WebOutlineRejection::RateLimited, DdgError::Unavailable => WebOutlineRejection::SearchUnavailable })
+    }
+    async fn enrich_engine(&self, response: SearchResponse) -> Result<Vec<RawCandidate>, String> {
+        let mut candidates = response.results.into_iter().filter_map(|result| {
+            is_public_http_url(&result.url).then(|| RawCandidate { title: clip(&result.title, 300), url: result.url, text: result.content })
+        }).take(MAX_CANDIDATES).collect::<Vec<_>>();
+        for candidate in &mut candidates {
+            if candidate.text.trim().is_empty() { candidate.text = self.fetch_page_text(&candidate.url).await.map_err(|error| error.to_string())?; }
+            candidate.text = clip(&candidate.text, MAX_CANDIDATE_CHARS);
+        }
+        Ok(candidates)
+    }
+    fn stage(&self, phase: SearchPhase) -> WebOutlineStage {
+        match phase { SearchPhase::TargetedSearch => WebOutlineStage::DdgSearch, SearchPhase::BroadSearch => WebOutlineStage::DdgSearchBroad, SearchPhase::Match => WebOutlineStage::DdgMatch, SearchPhase::Outline => WebOutlineStage::DdgOutline }
     }
 }
 
 /// Find a usable web outline. Fixed `Rejected` diagnostics require local
 /// fallback; cancellation is terminal and is never hidden. The optional result
 /// is retained for the caller's existing lookup interface.
-pub async fn find_outline(
-    tavily: &TavilyClient,
+pub(crate) async fn find_outline<E: SearchEngine>(
+    engine: &E,
     llm: &dyn LlmClient,
     lookup: &OutlineLookup,
     budget: WebOutlineBudget,
 ) -> Result<Option<VerifiedWebOutline>, WebOutlineError> {
-    find_outline_with_progress(tavily, llm, lookup, budget, &|_| {}).await
+    find_outline_with_progress(engine, llm, lookup, budget, &|_| {}).await
 }
 
 /// Same lookup, with synchronous lifecycle notifications suitable for a job
 /// updater. Notifications contain no local text, fetched content, hashes, or URLs.
-pub async fn find_outline_with_progress(
-    tavily: &TavilyClient,
+pub(crate) async fn find_outline_with_progress<E: SearchEngine>(
+    engine: &E,
     llm: &dyn LlmClient,
     lookup: &OutlineLookup,
     budget: WebOutlineBudget,
@@ -522,20 +580,24 @@ pub async fn find_outline_with_progress(
     validate_lookup(lookup)?;
     check_cancelled(llm)?;
     let query = search_query(lookup);
-    on_stage(WebOutlineStage::TargetedSearch);
-    let targeted = tavily.search(&query, Some(TARGET_DOMAINS)).await.ok();
+    on_stage(engine.stage(SearchPhase::TargetedSearch));
+    let targeted = engine.search_engine(&query, Some(TARGET_DOMAINS)).await;
     check_cancelled(llm)?;
-    on_stage(WebOutlineStage::Match);
-    let targeted = prepare_candidate_set(tavily, lookup, targeted).await;
+    on_stage(engine.stage(SearchPhase::Match));
+    let targeted = match targeted {
+        Ok(response) => prepare_candidate_set(engine, lookup, Some(response)).await,
+        Err(reason) => Err(reason),
+    };
     let selected = match targeted {
         Ok(set) => set,
         Err(WebOutlineRejection::AmbiguousSources) => return Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources)),
         Err(_) => {
-            on_stage(WebOutlineStage::BroadSearch);
-            let broad = tavily.search(&query, None).await.ok();
+            on_stage(engine.stage(SearchPhase::BroadSearch));
+            let broad = engine.search_engine(&query, None).await;
             check_cancelled(llm)?;
-            on_stage(WebOutlineStage::Match);
-            prepare_candidate_set(tavily, lookup, broad).await.map_err(WebOutlineError::Rejected)?
+            on_stage(engine.stage(SearchPhase::Match));
+            let broad = broad.map_err(WebOutlineError::Rejected)?;
+            prepare_candidate_set(engine, lookup, Some(broad)).await.map_err(WebOutlineError::Rejected)?
         }
     };
     check_cancelled(llm)?;
@@ -543,7 +605,7 @@ pub async fn find_outline_with_progress(
     check_cancelled(llm)?;
     let proof = validate_edition_verdict(&selected, verdict)
         .ok_or(WebOutlineError::Rejected(WebOutlineRejection::EditionUnverified))?;
-    on_stage(WebOutlineStage::Outline);
+    on_stage(engine.stage(SearchPhase::Outline));
     let value = call_outline_llm(llm, lookup, &selected.candidates, budget).await?;
     check_cancelled(llm)?;
     validate_llm_outline(lookup, &selected.candidates, &selected.primary, proof, value)
@@ -551,12 +613,11 @@ pub async fn find_outline_with_progress(
 }
 
 struct CandidateSet { candidates: Vec<RawCandidate>, primary: RawCandidate, proof_paragraph: String, proof_chapter_index: usize }
-
-async fn prepare_candidate_set(
-    tavily: &TavilyClient, lookup: &OutlineLookup, response: Option<SearchResponse>,
+async fn prepare_candidate_set<E: SearchEngine>(
+    engine: &E, lookup: &OutlineLookup, response: Option<SearchResponse>,
 ) -> Result<CandidateSet, WebOutlineRejection> {
     let response = response.ok_or(WebOutlineRejection::SearchUnavailable)?;
-    let candidates = enrich_candidates(tavily, response, lookup).await
+    let candidates = engine.enrich_engine(response).await
         .map_err(|_| WebOutlineRejection::SearchUnavailable)?;
     select_candidate_set(lookup, candidates)
 }
@@ -618,7 +679,7 @@ fn source_first_paragraph(lookup: &OutlineLookup, candidate: &RawCandidate) -> O
     first_paragraph(body, MAX_EDITION_PARAGRAPH_CHARS)
 }
 
-async fn enrich_candidates(tavily: &TavilyClient, response: SearchResponse, _lookup: &OutlineLookup) -> Result<Vec<RawCandidate>, String> {
+async fn enrich_candidates(tavily: &TavilyClient, response: SearchResponse) -> Result<Vec<RawCandidate>, String> {
     let mut candidates: Vec<RawCandidate> = response.results.into_iter().filter_map(|result| {
         is_public_http_url(&result.url).then(|| RawCandidate { title: clip(&result.title, 300), url: result.url, text: result.raw_content.unwrap_or_default() })
     }).take(MAX_CANDIDATES).collect();
@@ -1264,6 +1325,18 @@ mod tests {
     fn good_raw() -> &'static str { "钟楼书\n第一章 雨夜 林昭推开旧宅木门看见没有署名的信城南钟楼将在子夜敲响这是足够长的第一章正文夜雨落在青石台阶上而林昭握紧信封向钟楼走去她在钟声里想起失踪多年的姐姐于是决定独自查明真相后来她沿着河岸穿过寂静的长街反复确认信封上的蜡印并记录每一处可疑痕迹直到东方泛白她仍在思考钟楼管理员留下的谜语她决定第二天带着钥匙回到旧宅继续调查。\n第二章 钟楼，林昭在钟楼发现钥匙。补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据补录内容仅供来源页内部核验不应作为返回数据RAW_PAGE_ONLY_TRAILER" }
     fn good_outline() -> Value { json!({"plot_summary":"林昭循信件调查钟楼。", "plot_source_url":"https://public.example/chapter-1", "plot_evidence":"第二章 钟楼，林昭在钟楼发现钥匙", "plot_chapter_indices":[2], "characters":[{"name":"林昭","baseline":"收到信件后调查钟楼。","source_url":"https://public.example/chapter-1","evidence":"林昭推开旧宅木门看见没有署名的信","chapter_indices":[1]}], "chapters":[{"index":1,"heading":"第一章 雨夜","summary":"林昭发现信件。","source_url":"https://public.example/chapter-1","evidence":"第一章 雨夜 林昭推开旧宅木门"},{"index":2,"heading":"第二章 钟楼","summary":"林昭在钟楼发现钥匙。","source_url":"https://public.example/chapter-1","evidence":"第二章 钟楼，林昭在钟楼发现钥匙"}]}) }
 
+    #[tokio::test]
+    async fn ddg_ambiguous_candidates_are_terminal_without_broad_retry() {
+        let server = MockServer::start().await;
+        let body = format!("<a class='result__a' href='https://public.example/a'>钟楼书</a><a class='result__snippet'>{}</a><a class='result__a' href='https://public.example/b'>钟楼书</a><a class='result__snippet'>{}</a>", good_raw(), good_raw());
+        Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
+        let ddg = DuckDuckGoClient::with_endpoint(format!("{}/html/", server.uri())).unwrap();
+        let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
+        assert!(matches!(find_outline(&ddg, &llm, &lookup_fixture(), WebOutlineBudget::new(100_000, 4_096)).await, Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources))));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    }
+
     fn preface_lookup_and_source() -> (OutlineLookup, RawCandidate, Value) {
         let body = lookup_fixture().chapters.remove(0).text.replace("LOCAL_ONLY_SECRET_123", "");
         let mut chapters = vec![LocalOutlineChapter {
@@ -1609,6 +1682,15 @@ mod tests {
             assert!(!error.contains("tvly-secret"));
             assert!(!error.contains("tvly-server-echo"));
         }
+    }
+
+    #[test]
+    fn engine_stage_and_rejection_codes_are_redacted_and_stable() {
+        assert_eq!(WebOutlineStage::DdgSearch.as_str(), "ddg_search");
+        assert_eq!(WebOutlineStage::DdgSearchBroad.as_str(), "ddg_search_broad");
+        assert_eq!(WebOutlineStage::DdgMatch.as_str(), "ddg_match");
+        assert_eq!(WebOutlineStage::DdgOutline.as_str(), "ddg_outline");
+        assert_eq!(WebOutlineRejection::RateLimited.as_str(), "rate_limited");
     }
 
     #[tokio::test]
