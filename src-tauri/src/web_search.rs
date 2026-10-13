@@ -944,6 +944,7 @@ fn bibliographic_identity_matches(lookup: &OutlineLookup, candidate: &RawCandida
 }
 fn is_public_http_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else { return false; };
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return false; }
     let Some(host) = url.host_str() else { return false; };
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") { return false; }
@@ -1046,7 +1047,7 @@ mod tests {
             let server=MockServer::start().await;
             Mock::given(method("GET")).and(path("/book")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
             let client=injected_ddg(Arc::new(move |_,_|Ok(addresses.clone())),&server);
-            assert_eq!(client.resolve_fetch_addresses("public.example",80).await,Err(DdgError::Unavailable));
+            assert_eq!(client.fetch_page_text(&ddg_page_url(&server)).await,Err(DdgError::Unavailable));
             assert!(server.received_requests().await.unwrap().is_empty());
         }
     }
@@ -1222,6 +1223,12 @@ mod tests {
         assert_eq!(results[1].content, "第二章 黎明");
         assert_eq!(results[2].content, "第三章 旅途");
         assert_eq!(results[3].content, "第四章 归来");
+    }
+
+    #[test]
+    fn public_url_guard_rejects_credentials_and_non_http_schemes() {
+        assert!(!is_public_http_url("https://user:secret@public.example/book"));
+        assert!(!is_public_http_url("ftp://public.example/book"));
     }
 
     #[test]
