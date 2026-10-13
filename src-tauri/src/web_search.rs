@@ -272,8 +272,24 @@ fn parse_ddg_html(html: &str) -> Result<Vec<SearchResult>, DdgError> {
     static ATTRIBUTES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)\b(class|href)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
     let mut results: Vec<SearchResult> = Vec::new();
     let mut current = None;
+    struct Capture<'a> { element: &'a str, start: usize, depth: usize, index: usize, is_title: bool }
+    let mut active: Option<Capture<'_>> = None;
+    let finish = |capture: Capture<'_>, end: usize, results: &mut Vec<SearchResult>| {
+        let text = &html[capture.start..end];
+        if capture.is_title { results[capture.index].title = ddg_plain_text(text, 300); }
+        else { results[capture.index].content = ddg_plain_text(text, MAX_CANDIDATE_CHARS); }
+    };
     for tag in TAGS.captures_iter(html) {
-        if !tag[1].is_empty() { continue; }
+        let bounds = tag.get(0).unwrap();
+        if !tag[1].is_empty() {
+            if let Some(capture) = active.as_mut() {
+                if capture.element.eq_ignore_ascii_case(&tag[2]) {
+                    capture.depth -= 1;
+                    if capture.depth == 0 { finish(active.take().unwrap(), bounds.start(), &mut results); }
+                }
+            }
+            continue;
+        }
         let mut class = "";
         let mut href = "";
         for attribute in ATTRIBUTES.captures_iter(&tag[3]) {
@@ -283,35 +299,33 @@ fn parse_ddg_html(html: &str) -> Result<Vec<SearchResult>, DdgError> {
         }
         let is_title = tag[2].eq_ignore_ascii_case("a") && class.split_ascii_whitespace().any(|class| class == "result__a");
         let is_snippet = class.split_ascii_whitespace().any(|class| class == "result__snippet");
-        if !is_title && !is_snippet { continue; }
+        if !is_title && !is_snippet {
+            if let Some(capture) = active.as_mut() {
+                if capture.element.eq_ignore_ascii_case(&tag[2]) && !tag[3].trim_end().ends_with('/') {
+                    capture.depth += 1;
+                }
+            }
+            continue;
+        }
+        // A new result field also terminates an unclosed previous field. Text
+        // ranges never overlap, so malformed HTML cannot cause quadratic scans.
+        if let Some(capture) = active.take() { finish(capture, bounds.start(), &mut results); }
         if is_title {
             if results.len() == MAX_RESULTS { break; }
             current = None;
         }
-        // Find the matching close, including nested elements of the same kind.
-        let remainder = &html[tag.get(0).unwrap().end()..];
-        let mut depth = 1;
-        let mut text = None;
-        for closing in TAGS.captures_iter(remainder) {
-            if !closing[2].eq_ignore_ascii_case(&tag[2]) { continue; }
-            if closing[1].is_empty() {
-                if !closing[3].trim_end().ends_with('/') { depth += 1; }
-            } else {
-                depth -= 1;
-                if depth == 0 { text = Some(&remainder[..closing.get(0).unwrap().start()]); break; }
-            }
-        }
-        let Some(text) = text else { continue; };
         if is_title {
             if let Some(url) = ddg_result_url(href) {
                 current = Some(results.len());
-                results.push(SearchResult { title: ddg_plain_text(text, 300), url,
+                results.push(SearchResult { title: String::new(), url,
                     content: String::new(), raw_content: None, score: None });
             }
-        } else if let Some(index) = current {
-            results[index].content = ddg_plain_text(text, MAX_CANDIDATE_CHARS);
+        }
+        if let Some(index) = current {
+            active = Some(Capture { element: tag.get(2).unwrap().as_str(), start: bounds.end(), depth: 1, index, is_title });
         }
     }
+    if let Some(capture) = active { finish(capture, html.len(), &mut results); }
     Ok(results)
 }
 
@@ -820,6 +834,19 @@ mod tests {
         assert_eq!(results[1].content, "第二章 黎明");
         assert_eq!(results[2].content, "第三章 旅途");
         assert_eq!(results[3].content, "第四章 归来");
+    }
+
+    #[test]
+    fn ddg_parse_unclosed_snippets_terminate_with_linear_work() {
+        let html = format!("<a class='result__a' href='https://public.example/book'>书</a>{}",
+            "<span class='result__snippet'>text".repeat(30_000));
+        assert!(html.len() < MAX_HTTP_RESPONSE_BYTES);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = sender.send(parse_ddg_html(&html)); });
+        let results = receiver.recv_timeout(Duration::from_secs(5))
+            .expect("malformed snippets must not trigger repeated scans of the remaining HTML").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "text");
     }
 
     #[test]
