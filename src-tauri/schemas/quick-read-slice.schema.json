@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "quick_read_slice",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["chapter_summaries", "characters", "plot_notes"],
+  "properties": {
+    "chapter_summaries": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/chapter_summary"}
+    },
+    "characters": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/character_mention"}
+    },
+    "plot_notes": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/plot_note"}
+    }
+  },
+  "$defs": {
+    "chapter_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chapter_idx", "summary", "character_refs"],
+      "properties": {
+        "chapter_idx": {"type": "integer"},
+        "summary": {"type": "string"},
+        "character_refs": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "character_mention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "name", "aliases", "chapter_idx", "evidence"],
+      "properties": {
+        "ref": {"type": "string"},
+        "name": {"type": "string"},
+        "aliases": {"type": "array", "items": {"type": "string"}},
+        "chapter_idx": {"type": "integer"},
+        "evidence": {"type": "string"}
+      }
+    },
+    "plot_note": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "source_chapters"],
+      "properties": {
+        "summary": {"type": "string"},
+        "source_chapters": {"type": "array", "items": {"type": "integer"}}
+      }
+    }
+  }
+}

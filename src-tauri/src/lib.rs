@@ -12,6 +12,7 @@ pub mod core;
 pub mod creds;
 pub mod jobs;
 pub mod llm;
+pub mod web_search;
 pub mod store;
 
 use commands::AppState;
@@ -68,7 +69,8 @@ pub fn run() {
             commands::providers::provider_delete,
             commands::providers::provider_test,
             commands::status::get_extraction_statuses,
-            commands::kg::start_book_extraction,
+            commands::quick_read::start_quick_read,
+            commands::kg::cancel_book_jobs,
             commands::story::get_story_map,
             commands::story::save_intervention,
             commands::story::end_questionnaire,

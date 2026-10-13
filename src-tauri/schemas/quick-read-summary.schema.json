@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "quick_read_summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["characters", "plot_summary", "plot_notes"],
+  "properties": {
+    "characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["member_local_ids", "id", "name", "aliases", "identity_evidence", "motivations", "narrative_roles", "first_appearance_chapter", "revelations", "source_chapters"],
+        "properties": {
+          "member_local_ids": {"type": "array", "items": {"type": "string"}},
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "aliases": {"type": "array", "items": {"type": "string"}},
+          "identity_evidence": {"type": "array", "items": {"type": "string"}},
+          "motivations": {"type": "array", "items": {"type": "string"}},
+          "narrative_roles": {"type": "array", "items": {"type": "string"}},
+          "first_appearance_chapter": {"type": "integer"},
+          "revelations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["chapter_idx", "evidence"], "properties": {"chapter_idx": {"type": "integer"}, "evidence": {"type": "string"}}}},
+          "source_chapters": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    },
+    "plot_summary": {"type": "string"},
+    "plot_notes": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["summary", "source_chapters"], "properties": {"summary": {"type": "string"}, "source_chapters": {"type": "array", "items": {"type": "integer"}}}}}
+  }
+}

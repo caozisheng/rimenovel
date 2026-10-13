@@ -51,6 +51,12 @@ async function submit(): Promise<void> {
       <NFormItem label="API Key" path="api_key">
         <NInput v-model:value="providerPanel.form.api_key" type="password" show-password-on="click" :placeholder="providerPanel.form.id === null ? 'sk-...' : '留空保留已有密钥；输入新密钥则替换'" :input-props="{ autocomplete: 'off' }" />
       </NFormItem>
+      <NFormItem label="Tavily 联网概要" path="tavily_enabled">
+        <label class="toggle"><input v-model="providerPanel.form.tavily_enabled" type="checkbox" /> 启用搜索候选（优先起点等中文站点）</label>
+      </NFormItem>
+      <NFormItem v-if="providerPanel.form.tavily_enabled || providerPanel.form.tavily_api_key" label="Tavily API Key" path="tavily_api_key">
+        <NInput v-model:value="providerPanel.form.tavily_api_key" type="password" show-password-on="click" placeholder="留空保留已有 Key" :input-props="{ autocomplete: 'off' }" />
+      </NFormItem>
       <div class="row three">
         <NFormItem label="抽取模型"><NInput v-model:value="providerPanel.form.model_extract" placeholder="低价档" /></NFormItem>
         <NFormItem label="合并模型"><NInput v-model:value="providerPanel.form.model_merge" placeholder="中价档" /></NFormItem>
@@ -71,6 +77,7 @@ async function submit(): Promise<void> {
           <strong>{{ p.name }}</strong>
           <span class="meta">{{ p.protocol }} · {{ p.base_url }}</span>
           <span class="meta">抽取 {{ p.model_extract ?? '—' }} / 合并 {{ p.model_merge ?? '—' }} / 写作 {{ p.model_write ?? '—' }}</span>
+          <span class="meta">Tavily {{ p.tavily_enabled ? (p.has_tavily_key ? '已启用' : '缺 Key') : '未启用' }}</span>
           <span class="meta">预算 {{ p.context_limit ?? 32768 }} tokens · 预留 {{ p.output_reserve ?? 4096 }}</span>
         </div>
         <div class="item-ops">
@@ -82,7 +89,7 @@ async function submit(): Promise<void> {
     </ul>
     <NEmpty v-else description="还没有 Provider，先添加一个" class="empty" />
     <NAlert v-if="providerPanel.testResult" :type="providerPanel.testResult === '连接成功' ? 'success' : 'error'" class="notice">{{ providerPanel.testResult }}</NAlert>
-    <p class="hint">未填写的模型档位将在调用时报「未配置」错误。</p>
+    <p class="hint">Tavily 只接收书名、作者和章节标题；已配置的 LLM Provider 将接收本机首个实质章节与候选网页各自的一段正文来判别版别。判断不明确或章节来源不足时回退全文速读；原文不发给 Tavily。</p>
   </NModal>
 </template>
 

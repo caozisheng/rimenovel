@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { editProvider, providerPanel, resetForm } from "./providerPanel";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-const stored = { id: 4, name: "gateway", protocol: "openai", base_url: "https://old.example/v1", model_extract: "extract", model_write: "write", model_merge: "merge", context_limit: 65536, output_reserve: 8192 };
+const stored = { id: 4, name: "gateway", protocol: "openai", base_url: "https://old.example/v1", model_extract: "extract", model_write: "write", model_merge: "merge", context_limit: 65536, output_reserve: 8192, tavily_enabled:true, has_tavily_key:true };
 beforeEach(() => { resetForm(); providerPanel.rows = [{ ...stored }]; });
 
 describe("editing stored Providers", () => {
@@ -9,6 +9,8 @@ describe("editing stored Providers", () => {
     providerPanel.form.api_key = "previous-unsaved-secret";
     editProvider(providerPanel.rows[0]);
     expect(providerPanel.form.api_key).toBe("");
+    expect(providerPanel.form.tavily_api_key).toBe("");
+    expect(providerPanel.form.tavily_enabled).toBe(true);
     providerPanel.form.name = "renamed";
     providerPanel.form.base_url = "https://new.example/v1";
     expect(providerPanel.rows[0].name).toBe("gateway");
@@ -20,6 +22,8 @@ describe("editing stored Providers", () => {
     resetForm();
     expect(providerPanel.form.id).toBeNull();
     expect(providerPanel.form.api_key).toBe("");
+    expect(providerPanel.form.tavily_api_key).toBe("");
+    expect(providerPanel.form.tavily_enabled).toBe(false);
     expect(providerPanel.form.name).toBe("");
     expect(providerPanel.rows[0].id).toBe(stored.id);
   });

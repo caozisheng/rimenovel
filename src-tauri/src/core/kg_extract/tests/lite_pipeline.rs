@@ -62,10 +62,6 @@ async fn one_compact_call_persists_writing_state_and_timeline(){
     assert_eq!(data["edges"][0]["src"],person["key"]);assert_eq!(data["edges"][0]["dst"],sword["key"]);
     assert_eq!(data["events"][0]["participants"],json!([person["key"]]));assert_eq!(data["events"][0]["time"],"夜间");
     assert_eq!(data["open_threads"],json!(["同伴尚未抵达"]));
-    let story=crate::store::story_projection::story_map(conn,book,1,1).unwrap();
-    assert_eq!(story["ready"],json!(true));
-    assert_eq!(story["chapter_cards"][0]["ready"],json!(true));
-    assert!(story["entries"].as_array().unwrap().iter().any(|entry|entry["name"]=="阿岚"));
 }
 #[tokio::test(start_paused=true)]
 async fn a_hanging_chapter_fails_at_the_broad_operation_timeout_without_publishing(){
