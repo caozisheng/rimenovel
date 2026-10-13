@@ -244,6 +244,24 @@ impl DuckDuckGoClient {
         let html = std::str::from_utf8(&bytes).map_err(|_| DdgError::Unavailable)?;
         Ok(SearchResponse { results: parse_ddg_html(html)? })
     }
+
+    /// Fetch only a bounded public candidate page; errors never expose its URL or body.
+    pub async fn fetch_page_text(&self, url: &str) -> Result<String, DdgError> {
+        if !is_public_http_url(url) { return Err(DdgError::Unavailable); }
+        let mut response = self.http.get(url)
+            .timeout(Duration::from_secs(10))
+            .header(header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .send().await.map_err(|_| DdgError::Unavailable)?;
+        if !response.status().is_success() { return Err(DdgError::Unavailable); }
+        if response.content_length().is_some_and(|size| size > MAX_HTTP_RESPONSE_BYTES as u64) { return Err(DdgError::Unavailable); }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| DdgError::Unavailable)? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES { return Err(DdgError::Unavailable); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let html = std::str::from_utf8(&bytes).map_err(|_| DdgError::Unavailable)?;
+        Ok(clip(html_to_text(html), MAX_CANDIDATE_CHARS))
+    }
 }
 
 fn ddg_result_url(href: &str) -> Option<String> {
@@ -262,6 +280,66 @@ fn ddg_plain_text(html: &str, max: usize) -> String {
     let text = TAGS.replace_all(html, "");
     clip(text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
         .replace("&#39;", "'").replace("&nbsp;", " ").replace("&amp;", "&").trim(), max)
+}
+
+/// Minimal HTML conversion for chapter matching, not a DOM or layout parser.
+fn html_to_text(html: &str) -> String {
+    static HIDDEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
+        r"(?is)<!--.*?(?:-->|$)|<script\b[^>]*>.*?(?:</script\s*>|$)|<style\b[^>]*>.*?(?:</style\s*>|$)|<noscript\b[^>]*>.*?(?:</noscript\s*>|$)"
+    ).unwrap());
+    static TAGS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
+        r#"(?is)<\s*/?\s*([a-z][a-z0-9]*)\b(?:"[^"]*"|'[^']*'|[^'">])*>|<[^>]*>"#
+    ).unwrap());
+    static ENTITIES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(
+        r"&(?:amp|lt|gt|quot|nbsp|#[0-9]+|#[xX][0-9a-fA-F]+);"
+    ).unwrap());
+    const BLOCK_TAGS: &[&str] = &[
+        "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "p", "pre", "section", "summary", "table", "tbody", "tfoot", "thead", "tr", "ul",
+    ];
+    let visible = HIDDEN.replace_all(html, "");
+    let stripped = TAGS.replace_all(&visible, |tag: &regex::Captures<'_>| {
+        if tag.get(1).is_some_and(|name| BLOCK_TAGS.iter().any(|block| name.as_str().eq_ignore_ascii_case(block))) { "\n" }
+        else { "" }
+    });
+
+    // Decode once, after stripping markup, and normalize directly into the
+    // output without allocating a string per entity or per line. A newline
+    // wins over adjacent spaces; deferred whitespace also trims both ends.
+    let mut text = String::with_capacity(stripped.len());
+    let mut whitespace = None;
+    let mut push = |character: char| {
+        if character.is_whitespace() {
+            if matches!(character, '\r' | '\n') { whitespace = Some('\n'); }
+            else if whitespace != Some('\n') { whitespace = Some(' '); }
+        } else {
+            if let Some(separator) = whitespace.take() {
+                if !text.is_empty() { text.push(separator); }
+            }
+            text.push(character);
+        }
+    };
+    let mut offset = 0;
+    for entity in ENTITIES.find_iter(&stripped) {
+        for character in stripped[offset..entity.start()].chars() { push(character); }
+        let encoded = &entity.as_str()[1..entity.len() - 1];
+        let decoded = match encoded {
+            "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "nbsp" => Some(' '),
+            _ => {
+                let number = encoded.strip_prefix('#').unwrap();
+                let (digits, radix) = match number.strip_prefix('x').or_else(|| number.strip_prefix('X')) {
+                    Some(digits) => (digits, 16), None => (number, 10),
+                };
+                u32::from_str_radix(digits, radix).ok().and_then(char::from_u32)
+            }
+        };
+        if let Some(character) = decoded { push(character); }
+        else { for character in entity.as_str().chars() { push(character); } }
+        offset = entity.end();
+    }
+    for character in stripped[offset..].chars() { push(character); }
+    text
 }
 
 fn parse_ddg_html(html: &str) -> Result<Vec<SearchResult>, DdgError> {
@@ -792,6 +870,129 @@ mod tests {
     use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
     use wiremock::{Match, Request};
 
+
+    #[test]
+    fn html_to_text_strips_scripts_styles_and_noscript_content() {
+        let html = "<STYLE>.x{content:'<p>hidden</p>'}</STYLE><script>var a=\"<p>hidden\";</script><p>第一章&nbsp;雨夜</p><noscript><p>hidden fallback</p></noscript><p>林昭推门。</p>";
+        assert_eq!(html_to_text(html), "第一章 雨夜\n林昭推门。");
+    }
+
+    #[test]
+    fn html_to_text_decodes_named_and_numeric_entities_after_tags() {
+        assert_eq!(html_to_text("<p>&amp; &lt;p&gt; &quot; &#39; &nbsp; &#65; &#x4E2D; &#X1F600;</p>"), "& <p> \" ' A 中 😀");
+        assert_eq!(html_to_text("&amp;lt; &unknown; &#xD800; &#99999999; &#oops;"), "&lt; &unknown; &#xD800; &#99999999; &#oops;");
+    }
+
+    #[test]
+    fn html_to_text_removes_comments_including_embedded_tags() {
+        assert_eq!(html_to_text("<p>雨<!-- secret > <div>hidden</div> -->夜</p><!-- trailing -->"), "雨夜");
+    }
+
+    #[test]
+    fn html_to_text_collapses_spaces_and_blank_lines() {
+        assert_eq!(html_to_text(" \t 第一章 \t  雨夜 \r\n \n\n 林昭\u{a0}  推门。 \n "), "第一章 雨夜\n林昭 推门。");
+        assert_eq!(html_to_text("<p> \t </p><div>\n</div>"), "");
+    }
+
+    #[test]
+    fn html_to_text_preserves_block_boundaries_and_inline_text() {
+        let html = "<div><h1>第一章</h1><p>雨<b>夜</b><br/>林昭</p><ul><li>推门</li><li>取信</li></ul><table><tr><td>钟楼</td><td>子夜</td></tr><tr><td>黎明</td></tr></table></div>";
+        assert_eq!(html_to_text(html), "第一章\n雨夜\n林昭\n推门\n取信\n钟楼子夜\n黎明");
+    }
+
+    // Keep production URL validation active: a public-looking host resolves
+    // only inside this client's test transport to the loopback mock server.
+    fn ddg_page_client(server: &MockServer) -> DuckDuckGoClient {
+        DuckDuckGoClient {
+            http: Client::builder().no_proxy().resolve("public.example", *server.address()).build().unwrap(),
+            endpoint: format!("{}/html/", server.uri()),
+        }
+    }
+
+    fn ddg_page_url(server: &MockServer) -> String {
+        format!("http://public.example:{}/book", server.address().port())
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_returns_page_text_without_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<style>hidden</style><h1>第一章&nbsp;雨夜</h1><p>林昭<b>推门</b>。&#x4E2D;</p>"))
+            .expect(1).mount(&server).await;
+        let client = ddg_page_client(&server);
+        assert_eq!(client.fetch_page_text(&ddg_page_url(&server)).await.unwrap(), "第一章 雨夜\n林昭推门。中");
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].body.is_empty());
+        assert!(!requests[0].headers.contains_key("authorization"));
+        assert!(!requests[0].headers.contains_key("cookie"));
+        assert!(requests[0].headers.get("user-agent").unwrap().to_str().unwrap().contains("Mozilla/5.0"));
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_clips_text_by_characters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("<p>{}</p>", "章".repeat(MAX_CANDIDATE_CHARS + 1))))
+            .expect(1).mount(&server).await;
+        assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await.unwrap(), "章".repeat(MAX_CANDIDATE_CHARS));
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_refuses_private_and_invalid_urls_before_request() {
+        let server = MockServer::start().await;
+        let client = ddg_page_client(&server);
+        for url in [server.uri(), "https://127.0.0.1/".into(), "http://10.2.3.4/book".into(),
+            "http://192.168.1.2/book".into(), "http://localhost/book".into(), "/relative".into(),
+            "not a URL".into(), "file:///book".into(), "https://user:secret@public.example/book".into()] {
+            assert_eq!(client.fetch_page_text(&url).await, Err(DdgError::Unavailable));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_rejects_oversized_body_and_accepts_exact_limit() {
+        for size in [MAX_HTTP_RESPONSE_BYTES, MAX_HTTP_RESPONSE_BYTES + 1] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/book"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw("x".repeat(size), "text/html"))
+                .expect(1).mount(&server).await;
+            let result = ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await;
+            if size == MAX_HTTP_RESPONSE_BYTES { assert_eq!(result.unwrap(), "x".repeat(MAX_CANDIDATE_CHARS)); }
+            else { assert_eq!(result, Err(DdgError::Unavailable)); }
+        }
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_non_success_status_is_unavailable_and_redacted() {
+        for status in [400, 403, 404, 500] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/book"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("SECRET_PAGE_BODY"))
+                .expect(1).mount(&server).await;
+            let error = ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await.unwrap_err();
+            assert_eq!(error, DdgError::Unavailable);
+            assert!(!error.to_string().contains("SECRET_PAGE_BODY"));
+            assert!(!error.to_string().contains("public.example"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_invalid_utf8_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(vec![0xff, 0xfe], "text/html"))
+            .expect(1).mount(&server).await;
+        assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await, Err(DdgError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn ddg_fetch_times_out_after_ten_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("late").set_delay(Duration::from_secs(11)))
+            .expect(1).mount(&server).await;
+        assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await, Err(DdgError::Unavailable));
+    }
     #[test]
     fn ddg_parse_unwraps_redirect_and_strips_snippet_tags() {
         let html = r#"<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fpublic.example%2Fbook%3Fa%3D1%26b%3D2&amp;rut=ignored" class="result__a">书名 &amp; <b>章节</b></a>
