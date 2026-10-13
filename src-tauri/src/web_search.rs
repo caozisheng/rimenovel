@@ -1365,19 +1365,23 @@ mod tests {
         assert_eq!(client.search("书名 第一章", None).await.unwrap_err(), "Tavily 响应过大");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn request_timeout_uses_paused_clock_without_a_real_wait() {
         let server = MockServer::start().await;
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_by_server = Arc::clone(&accepted);
         Mock::given(method("POST")).and(path("/search"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(21)).set_body_json(json!({"results":[]})))
+            .respond_with(move |_: &Request| {
+                accepted_by_server.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(21)).set_body_json(json!({"results":[]}))
+            })
             .expect(1).mount(&server).await;
         let client = Arc::new(TavilyClient::with_endpoint("tvly-secret".into(), format!("{}/search", server.uri())).unwrap());
         let request = tokio::spawn({ let client = Arc::clone(&client); async move { client.search("书名 第一章", None).await } });
-        for _ in 0..10 {
-            if !server.received_requests().await.unwrap().is_empty() { break; }
-            tokio::task::yield_now().await;
-        }
-        assert!(!server.received_requests().await.unwrap().is_empty());
+        // Real socket readiness is not guaranteed by a fixed number of yields.
+        // Pause only after the server confirms receipt, as provider tests do.
+        tokio::time::timeout(Duration::from_secs(5), accepted.notified()).await.unwrap();
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(21)).await;
         assert_eq!(request.await.unwrap().unwrap_err(), "Tavily 请求失败");
     }
