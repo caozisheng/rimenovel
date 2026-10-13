@@ -77,8 +77,8 @@ async fn ddg_ambiguous_sources_skip_tavily_and_fall_back_locally(){
  let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
  let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
  let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();let rejections=parking_lot::Mutex::new(Vec::new());
- let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason))).await.unwrap();
- assert!(result.is_none());assert_eq!(llm.calls.load(Ordering::SeqCst),0);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::AmbiguousSources);
+ let local=AtomicUsize::new(0);let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason)),&||{local.fetch_add(1,Ordering::SeqCst);}).await.unwrap();
+ assert!(result.is_none());assert_eq!(local.load(Ordering::SeqCst),1);assert_local_fallback_progress();assert_eq!(llm.calls.load(Ordering::SeqCst),0);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::AmbiguousSources);
 }
 
 #[tokio::test]
@@ -89,10 +89,29 @@ async fn ddg_ai_different_skips_tavily_and_falls_back_locally(){
  let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
  let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
  let llm=WebMatrixClient{verdict:"different",calls:AtomicUsize::new(0)};let token=CancellationToken::new();let rejections=parking_lot::Mutex::new(Vec::new());
- let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason))).await.unwrap();
- assert!(result.is_none());assert_eq!(llm.calls.load(Ordering::SeqCst),1);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::EditionUnverified);
+ let local=AtomicUsize::new(0);let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|engine,reason|rejections.lock().push((engine.to_owned(),reason)),&||{local.fetch_add(1,Ordering::SeqCst);}).await.unwrap();
+ assert!(result.is_none());assert_eq!(local.load(Ordering::SeqCst),1);assert_local_fallback_progress();assert_eq!(llm.calls.load(Ordering::SeqCst),1);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);assert_eq!(rejections.lock()[0].1,crate::web_search::WebOutlineRejection::EditionUnverified);
+}
+#[tokio::test]
+async fn ddg_ai_uncertain_skips_tavily_and_falls_back_locally(){
+ let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
+ Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(ddg_candidate_results(1))).expect(1).mount(&ddg_server).await;
+ Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&tavily_server).await;
+ let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
+ let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
+ let llm=WebMatrixClient{verdict:"uncertain",calls:AtomicUsize::new(0)};let token=CancellationToken::new();
+ let local=AtomicUsize::new(0);let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{local.fetch_add(1,Ordering::SeqCst);}).await.unwrap();
+ assert!(result.is_none());assert_eq!(local.load(Ordering::SeqCst),1);assert_local_fallback_progress();assert_eq!(llm.calls.load(Ordering::SeqCst),1);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);
 }
 
+fn assert_local_fallback_progress(){
+ let (conn,book,_,_,_,_)=fixture(vec!["本地全文一章".into()],100);
+ let job=jobs::enqueue(&conn.lock(),book,jobs::JobKind::QuickRead,json!({"phase":"quick_read"})).unwrap();jobs::mark_running(&conn.lock(),job).unwrap();
+ mark_local_fallback_progress(&conn.lock(),job).unwrap();
+ let payload:String=conn.lock().query_row("SELECT payload_json FROM jobs WHERE id=?1",[job],|row|row.get(0)).unwrap();
+ let payload:Value=serde_json::from_str(&payload).unwrap();
+ assert_eq!(payload["phase"],"local_fallback");assert_eq!(payload["quick_read_source"],"local_full_text");
+}
 #[tokio::test]
 async fn ddg_infrastructure_failure_retries_tavily_successfully(){
  let ddg_server=MockServer::start().await;let tavily_server=MockServer::start().await;
@@ -101,7 +120,7 @@ async fn ddg_infrastructure_failure_retries_tavily_successfully(){
  let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
  let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
  let llm=WebMatrixClient{verdict:"same",calls:AtomicUsize::new(0)};let token=CancellationToken::new();
- let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await.unwrap();
+ let result=find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{}).await.unwrap();
  assert!(result.is_some());assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);assert_eq!(tavily_server.received_requests().await.unwrap().len(),1);
 }
 
@@ -111,7 +130,7 @@ async fn web_layer_cancellation_is_terminal_before_any_engine_request(){
  let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
  let tavily=crate::web_search::TavilyClient::with_endpoint("test-key".into(),format!("{}/search",tavily_server.uri())).unwrap();
  let llm=OfflineClient::new();let token=CancellationToken::new();token.cancel();
- assert!(matches!(find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await,Err(crate::web_search::WebOutlineError::Cancelled)));
+ assert!(matches!(find_web_outline_layers(Some(&ddg),Some(&tavily),&llm,&web_lookup_fixture(),crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{}).await,Err(crate::web_search::WebOutlineError::Cancelled)));
  assert_eq!(ddg_server.received_requests().await.unwrap().len(),0);assert_eq!(tavily_server.received_requests().await.unwrap().len(),0);
 }
 
@@ -130,7 +149,7 @@ async fn web_layers_skip_tavily_without_key_after_ddg_infrastructure_failure(){
  let ddg=crate::web_search::DuckDuckGoClient::with_endpoint(format!("{}/html/",ddg_server.uri())).unwrap();
  let lookup=crate::web_search::OutlineLookup{book_title:"钟楼书".into(),author:None,chapters:vec![crate::web_search::LocalOutlineChapter{index:1,heading:"第一章 雨夜".into(),text:"林昭在雨夜走进旧宅寻找钟楼的线索，这是足够长的本地首段正文。".into()}]};
  let client=OfflineClient::new();let token=CancellationToken::new();
- let result=find_web_outline_layers(Some(&ddg),None,&client,&lookup,crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{}).await.unwrap();
+ let result=find_web_outline_layers(Some(&ddg),None,&client,&lookup,crate::web_search::WebOutlineBudget::new(100_000,4_096),&token,&|_|{},&|_,_|{},&||{}).await.unwrap();
  assert!(result.is_none());
  assert_eq!(ddg_server.received_requests().await.unwrap().len(),2);
 }
