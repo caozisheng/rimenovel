@@ -657,7 +657,7 @@ async fn prepare_candidate_set<E: SearchEngine>(
 /// A group supplies every chapter, while its first proof-bearing page alone
 /// anchors the unchanged AI edition comparison; retain all pages for provenance.
 /// Shared chapter bodies must agree after normalizing their first 200 characters
-/// (excluding the heading line); identical mirrors and disjoint pages coexist.
+/// (excluding the heading prefix); identical mirrors and disjoint pages coexist.
 fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -> Result<CandidateSet, WebOutlineRejection> {
     let mut groups: BTreeMap<String, Vec<RawCandidate>> = BTreeMap::new();
     let mut has_text = false;
@@ -694,7 +694,7 @@ fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -
                 let mut shared_prefix = None;
                 for candidate in &group {
                     let Some(section) = chapter_section(chapter, &lookup.chapters, &candidate.text) else { continue; };
-                    let body = section.split_once('\n').map_or("", |(_, body)| body);
+                    let Some(body) = chapter_body(chapter, section) else { continue; };
                     let end = body.char_indices().nth(200).map_or(body.len(), |(offset, _)| offset);
                     let prefix = normalize(&body[..end]);
                     // Equality with the first located section proves pairwise
@@ -759,6 +759,12 @@ fn first_paragraph(text: &str, max_chars: usize) -> Option<String> {
 fn source_first_paragraph(lookup: &OutlineLookup, candidate: &RawCandidate) -> Option<String> {
     let chapter = proof_chapter(lookup)?;
     let section = chapter_section(chapter, &lookup.chapters, &candidate.text)?;
+    first_paragraph(chapter_body(chapter, section)?, MAX_EDITION_PARAGRAPH_CHARS)
+}
+
+/// Consume only the heading prefix, preserving prose on the same line as well
+/// as prose following a standalone heading for both proof and conflict checks.
+fn chapter_body<'a>(chapter: &LocalOutlineChapter, section: &'a str) -> Option<&'a str> {
     let (heading_line, rest) = section.split_once('\n').unwrap_or((section, ""));
     let heading_line = heading_line.trim_start();
     let wanted = normalize(&chapter.heading);
@@ -766,7 +772,7 @@ fn source_first_paragraph(lookup: &OutlineLookup, candidate: &RawCandidate) -> O
         (normalize(&heading_line[..offset]) == wanted).then_some(&heading_line[offset..])
     }).or_else(|| (normalize(heading_line) == wanted).then_some(""))?;
     let body = if after_heading.trim().is_empty() { rest } else { &section[heading_line.len() - after_heading.len()..] };
-    first_paragraph(body, MAX_EDITION_PARAGRAPH_CHARS)
+    Some(body.trim_start())
 }
 
 async fn enrich_candidates(tavily: &TavilyClient, response: SearchResponse) -> Result<Vec<RawCandidate>, String> {
@@ -1697,9 +1703,37 @@ mod tests {
         let lookup = lookup_fixture();
         let first = RawCandidate { title: "钟楼书".into(), url: "https://public.example/a".into(), text: good_raw().into() };
         let second = RawCandidate { url: "https://public.example/b".into(), ..first.clone() };
+        for chapter in &lookup.chapters {
+            let section = chapter_section(chapter, &lookup.chapters, &first.text).unwrap();
+            assert!(section.lines().next().unwrap().contains("林昭"));
+        }
         let selected = select_candidate_set(&lookup, vec![first.clone(), second]).unwrap();
         assert_eq!(selected.candidates.len(), 2);
         assert_eq!(selected.primary.url, first.url);
+    }
+
+    #[test]
+    fn conflicting_inline_section_text_rejects_group() {
+        let lookup = lookup_fixture();
+        let first = RawCandidate { title: "钟楼书".into(), url: "https://public.example/a".into(), text: good_raw().into() };
+        for (original, changed) in [("林昭推开旧宅木门", "林昭离开旧宅木门"), ("林昭在钟楼发现钥匙", "林昭在旧宅发现钥匙")] {
+            let second = RawCandidate {
+                url: "https://public.example/b".into(), text: first.text.replace(original, changed), ..first.clone()
+            };
+            assert!(matches!(select_candidate_set(&lookup, vec![first.clone(), second]), Err(WebOutlineRejection::AmbiguousSources)),
+                "inline body conflict must be detected: {original}");
+        }
+    }
+
+    #[test]
+    fn inline_and_separate_heading_mirrors_compare_the_same_body() {
+        let lookup = lookup_fixture();
+        let first = RawCandidate { title: "钟楼书".into(), url: "https://public.example/a".into(), text: good_raw().into() };
+        let second = RawCandidate {
+            url: "https://public.example/b".into(),
+            text: first.text.replace("雨夜 ", "雨夜\n").replace("钟楼，", "钟楼\n，"), ..first.clone()
+        };
+        assert_eq!(select_candidate_set(&lookup, vec![first, second]).unwrap().candidates.len(), 2);
     }
 
     #[test]
@@ -1720,7 +1754,7 @@ mod tests {
         let (lookup, mut candidates) = multi_page_fixture("public.example");
         let mirror = RawCandidate {
             url: "https://public.example/mirror".into(),
-            text: candidates[0].text.replace("第1章", "第一章 镜像页").replace("钟声。", "钟声！"),
+            text: candidates[0].text.replace("第1章", "第一章").replace("钟声。", "钟声！"),
             ..candidates[0].clone()
         };
         candidates.push(mirror);
