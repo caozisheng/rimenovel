@@ -203,16 +203,12 @@ pub fn active_reference(conn:&Connection,book:i64)->Result<Option<QuickReadRefer
         "local_full_text"=>{if total_slices<=0||completed_slices!=total_slices||completed_chars!=total_chars{return Ok(None);}let slices=load_slices(conn,revision)?;if slices.len()!=total_slices as usize{return Ok(None);}validate_quick_read_coverage(&sources,&slices)?;let chapter_summaries=crate::core::quick_read::canonical_chapter_summaries(&slices);let reference=QuickReadReference{schema_version,source_digest,source_kind:QuickReadSourceKind::LocalFullText,provider_id,model,prompt_version,chapter_summaries,characters,plot_summary,plot_notes,completed_spans:slices.iter().flat_map(|slice|slice.source_spans.clone()).collect(),source_provenance:vec![]};validate_reference_baseline(&sources,&reference)?;Ok(Some(reference))}
         "web_outline"=>{
             if total_chars!=0||completed_chars!=0||total_slices!=0||completed_slices!=0{return Ok(None);}
-            let Some((match_score,provenance_json,proof_kind,proof_chapter_idx,engine,stored)):Option<(Option<f64>,String,String,i64,String,String)>=conn.query_row("SELECT w.match_score,w.provenance_json,w.proof_kind,w.proof_chapter_idx,w.search_engine,r.dependency_digest FROM quick_read_web_outlines w JOIN quick_read_revisions r ON r.id=w.revision_id WHERE w.revision_id=?1",[revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(error)? else{return Ok(None)};
+            let Some((match_score,provenance_json,proof_kind,proof_chapter_idx)):Option<(Option<f64>,String,String,i64)>=conn.query_row("SELECT match_score,provenance_json,proof_kind,proof_chapter_idx FROM quick_read_web_outlines WHERE revision_id=?1",[revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(error)? else{return Ok(None)};
             validate_persisted_edition_proof(&proof_kind,proof_chapter_idx,match_score)?;
             let source_provenance:Vec<WebOutlineProvenance>=decode(&provenance_json)?;validate_web_provenance(&source_provenance)?;
             if !validate_persisted_web_map(conn,revision,book,&sources,&source_provenance,proof_chapter_idx)?{return Ok(None);}
             let chapter_summaries=load_exact_chapter_summaries(conn,revision,&sources)?;
-            // Legacy proof rows remain inspectable, but readiness only admits
-            // the current AI prompt. Current rows use their own producing engine.
-            if prompt_version=="web-outline/ai-paragraph-v1" {
-                if crate::commands::quick_read::web_outline_dependency(conn,provider_id,&engine).ok().flatten().as_deref()!=Some(stored.as_str()){return Ok(None);}
-            }
+            // Historical references remain inspectable; consumers check current readiness separately.
             let reference=QuickReadReference{schema_version,source_digest,source_kind:QuickReadSourceKind::WebOutline,provider_id,model,prompt_version,chapter_summaries,characters,plot_summary,plot_notes,completed_spans:vec![],source_provenance};validate_reference_baseline(&sources,&reference)?;Ok(Some(reference))
         }
         _=>Ok(None),

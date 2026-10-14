@@ -347,10 +347,11 @@ fn explicit_nondefault_provider_can_publish_verified_web_reference() {
  let book=create_book_with_chapters(&conn,"Guard",None,"txt","test",&[NewChapter{idx:1,title:"One".into(),text:"source chapter".into(),token_est:4}]).unwrap();
  let sources=repo::source_chapters(&conn,book).unwrap();
  let proof=crate::web_search::EditionProof{chapter_index:1,method:crate::web_search::EditionProofMethod::AiParagraph,provenance:crate::web_search::WebOutlineProvenance{url:"https://public.example/source".into(),title:"source".into(),evidence:"公开候选首段足够长".into()}};
- let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&sources),source_kind:crate::core::quick_read::QuickReadSourceKind::WebOutline,provider_id:selected,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:vec![crate::core::quick_read::ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![crate::core::quick_read::QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![crate::core::quick_read::QuickReadPlotNote{summary:"公开主线".into(),source_chapters:vec![1]}],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
+ let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&sources),source_kind:crate::core::quick_read::QuickReadSourceKind::WebOutline,provider_id:selected,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v2".into(),chapter_summaries:vec![crate::core::quick_read::ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![crate::core::quick_read::QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![crate::core::quick_read::QuickReadPlotNote{summary:"公开主线".into(),source_chapters:vec![1]}],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
  let dependency=web_outline_dependency(&conn,selected,"tavily").unwrap().unwrap();
  assert!(publish_web_reference_if_current(&conn,book,selected,"reader","Guard",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
  assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference));
+ assert_eq!(conn.query_row("SELECT prompt_version FROM quick_read_revisions WHERE book_id=?1 AND active=1",[book],|row|row.get::<_,String>(0)).unwrap(),"web-outline/ai-paragraph-v2");
 }
 
 fn engine_reference_fixture(name:&str,with_tavily_key:bool)->(Connection,i64,i64,String,crate::web_search::EditionProof,crate::core::quick_read::QuickReadReference){
@@ -360,14 +361,24 @@ fn engine_reference_fixture(name:&str,with_tavily_key:bool)->(Connection,i64,i64
  conn.execute("INSERT INTO llm_providers(name,protocol,base_url,key_ref,model_extract,model_merge,tavily_key_ref,params_json) VALUES (?1,'openai','https://example.test/v1',?2,'reader','writer',?3,'{\"tavily_enabled\":true}')",rusqlite::params![name,llm_key,with_tavily_key.then_some(&search_key)]).unwrap();let provider=conn.last_insert_rowid();
  let book=create_book_with_chapters(&conn,name,None,"txt",name,&[NewChapter{idx:1,title:"One".into(),text:"source chapter".into(),token_est:4}]).unwrap();
  let proof=crate::web_search::EditionProof{chapter_index:1,method:crate::web_search::EditionProofMethod::AiParagraph,provenance:crate::web_search::WebOutlineProvenance{url:"https://public.example/source".into(),title:"source".into(),evidence:"公开候选首段足够长".into()}};
- let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&repo::source_chapters(&conn,book).unwrap()),source_kind:QuickReadSourceKind::WebOutline,provider_id:provider,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v1".into(),chapter_summaries:vec![ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
+ let reference=crate::core::quick_read::QuickReadReference{schema_version:"web-outline/v1".into(),source_digest:repo::source_digest(&repo::source_chapters(&conn,book).unwrap()),source_kind:QuickReadSourceKind::WebOutline,provider_id:provider,model:"reader".into(),prompt_version:"web-outline/ai-paragraph-v2".into(),chapter_summaries:vec![ChapterQuickRead{chapter_idx:1,summary:"第一章大纲".into(),character_refs:vec!["web-c".into()]}],characters:vec![QuickReadCharacterCard{id:"web-c".into(),name:"阿七".into(),aliases:vec![],identity_evidence:vec!["公开文本描述".into()],motivations:vec![],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![],source_chapters:vec![1]}],plot_summary:"公开主线".into(),plot_notes:vec![],completed_spans:vec![],source_provenance:vec![proof.provenance.clone()]};
  (conn,book,provider,search_key,proof,reference)
 }
+#[test]
+fn v1_rows_are_not_ready_after_v2_bump(){
+ let (conn,book,provider,_,proof,mut reference)=engine_reference_fixture("v1-stale",false);
+ reference.prompt_version="web-outline/ai-paragraph-v1".into();
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ repo::publish_web_reference(&conn,book,"v1-stale",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap();
+ assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference));
+ assert!(!web_reference_source_ready(&conn,book));
+}
+
 
 #[test]
 fn ddg_outline_can_publish_without_tavily_key(){
  let (conn,book,provider,_,proof,reference)=engine_reference_fixture("ddg-no-key",false);
- let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v2:ddg:{provider}").as_bytes());
  assert_eq!(web_outline_dependency(&conn,provider,"ddg").unwrap(),Some(dependency.clone()));
  assert!(web_outline_dependency(&conn,provider,"tavily").unwrap().is_none());
  assert!(publish_web_reference_if_current(&conn,book,provider,"reader","ddg-no-key",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
@@ -378,7 +389,7 @@ fn ddg_outline_can_publish_without_tavily_key(){
 #[test]
 fn ddg_outline_stays_ready_across_tavily_key_rotation(){
  let (conn,book,provider,key,proof,reference)=engine_reference_fixture("ddg-rotation",true);
- let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v2:ddg:{provider}").as_bytes());
  assert_eq!(web_outline_dependency(&conn,provider,"ddg").unwrap(),Some(dependency.clone()));
  assert!(publish_web_reference_if_current(&conn,book,provider,"reader","ddg-rotation",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
  crate::creds::save(&key,"rotated-tavily-key").unwrap();
@@ -390,20 +401,20 @@ fn ddg_outline_stays_ready_across_tavily_key_rotation(){
 fn tavily_outline_becomes_stale_after_key_rotation(){
  let (conn,book,provider,key,proof,reference)=engine_reference_fixture("tavily-rotation",true);
  let dependency=web_outline_dependency(&conn,provider,"tavily").unwrap().unwrap();
- assert_eq!(dependency,crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:{provider}:original-tavily-key").as_bytes()));
+ assert_eq!(dependency,crate::core::kg::digest(format!("web-outline/ai-paragraph-v2:{provider}:original-tavily-key").as_bytes()));
  assert!(publish_web_reference_if_current(&conn,book,provider,"reader","tavily-rotation",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
  assert!(web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_some());
  crate::creds::save(&key,"rotated-tavily-key").unwrap();
- assert!(!web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_none());
+ assert!(!web_reference_source_ready(&conn,book));assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference.clone()));
  assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","tavily-rotation",&proof,&dependency,"tavily",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
 }
 
 #[test]
 fn ddg_outline_becomes_stale_when_web_search_is_disabled(){
  let (conn,book,provider,_,proof,reference)=engine_reference_fixture("ddg-disabled",false);
- let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v1:ddg:{provider}").as_bytes());
+ let dependency=crate::core::kg::digest(format!("web-outline/ai-paragraph-v2:ddg:{provider}").as_bytes());
  repo::publish_web_reference(&conn,book,"ddg-disabled",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap();
  conn.execute("UPDATE llm_providers SET params_json='{\"tavily_enabled\":false}' WHERE id=?1",[provider]).unwrap();
- assert!(!web_reference_source_ready(&conn,book));assert!(repo::active_reference(&conn,book).unwrap().is_none());
+ assert!(!web_reference_source_ready(&conn,book));assert_eq!(repo::active_reference(&conn,book).unwrap(),Some(reference.clone()));
  assert!(!publish_web_reference_if_current(&conn,book,provider,"reader","ddg-disabled",&proof,&dependency,"ddg",&[(1,"One".into(),proof.provenance.url.clone())],&reference).unwrap());
 }
