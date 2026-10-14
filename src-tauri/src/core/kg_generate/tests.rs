@@ -1,224 +1,215 @@
 use super::*;
-use crate::core::kg::{empty_view, EditInput, GraphEvent};
+use crate::core::quick_read::{ChapterQuickRead, QuickReadCharacterCard, QuickReadCharacterMention, QuickReadReference, QuickReadSlice, SourceSpan};
+use crate::store::{books::{create_book_with_chapters, NewChapter}, Db};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-fn view(purpose:&str,chapter:i64)->GraphView {
-    GraphView {chapter_idx:Some(chapter),reader_progress:chapter,ready:true,reading_line_version:1,..empty_view(purpose)}
+fn config() -> RuntimeConfig {
+    RuntimeConfig { provider_id:1, model_extract:"extract".into(), context_limit:65536, output_reserve:4096, prompt_version:"kg-lite/v1".into() }
 }
-fn node(key:&str,name:&str,chapter:i64,provenance:&str)->GraphNode {
-    GraphNode {key:key.into(),entity_type:"character".into(),name:name.into(),aliases:vec![],summary:None,
-        life_status:None,location:None,owner:None,chapter_idx:chapter,provenance:provenance.into()}
+fn provider() -> ProviderConfig {
+    ProviderConfig { id:1, name:"recorded".into(), protocol:"openai".into(), base_url:"http://recorded".into(), model_extract:Some("extract".into()), model_write:Some("write".into()), model_merge:Some("merge".into()), api_key:String::new() }
 }
-fn event(key:&str,participant:&str)->GraphEvent {
-    GraphEvent {key:key.into(),title:"送信".into(),chapter_idx:2,order:0,participants:vec![participant.into()],
-        location:None,time:Some("清晨".into()),summary:"送达消息".into(),provenance:"ai_adapted".into()}
+fn database() -> (Connection, i64) {
+    let conn=Connection::open_in_memory().unwrap(); Db::apply_pragmas(&conn).unwrap(); Db::new(&conn).migrate().unwrap();
+    conn.execute("INSERT INTO llm_providers(id,name,protocol,base_url,key_ref,model_extract,model_write,model_merge,params_json) VALUES (1,'recorded','openai','http://recorded','unused','extract','write','merge',?1)",[json!({"context_limit":65536,"output_reserve":4096}).to_string()]).unwrap();
+    crate::creds::save("unused","test-key").unwrap();
+    let chapters=(1..=3).map(|idx|NewChapter { idx, title:format!("章{idx}"), text:format!("原作第{idx}章完整正文：顾岚守城。"), token_est:30 }).collect::<Vec<_>>();
+    let book=create_book_with_chapters(&conn,"paired",None,"txt","paired",&chapters).unwrap();
+    repo::mark_read(&conn,book,1).unwrap(); (conn,book)
 }
-fn context()->GenerationContext {
-    GenerationContext {book_id:1,chapter_idx:2,reading_line_version:1,digest:String::new(),actual:view("actual",1),
-        spec:view("spec",2),previous_text:"已发生的选中正文".into(),reference_text:Some("原作未来只是参考".into()),
-        style_guide:None,directives:vec!["不要伤害信使".into()],drift_pref:0.3}
+fn bootstrap(conn:&Connection,book:i64) {
+    use crate::store::quick_read as quick;
+    let sources=quick::source_chapters(conn,book).unwrap();
+    let spans=sources.iter().map(|source|vec![SourceSpan { chapter_idx:source.chapter_idx, start_char:0, end_char:source.char_count, content_hash:source.content_hash.clone() }]).collect::<Vec<_>>();
+    let revision=quick::prepare_revision(conn,book,&sources,"reference",1,"extract","v1","v1",&spans).unwrap();
+    let mut slices=Vec::new();
+    for (index,source) in sources.iter().enumerate() {
+        let slice=QuickReadSlice { slice_idx:index, source_spans:spans[index].clone(), chapter_summaries:vec![ChapterQuickRead { chapter_idx:source.chapter_idx, summary:format!("守城{index}"), character_refs:vec![format!("s{index}:hero")] }], characters:vec![QuickReadCharacterMention { local_id:format!("s{index}:hero"), name:"顾岚".into(), aliases:vec![], chapter_idx:source.chapter_idx, evidence:"守城".into() }], plot_notes:vec![] };
+        quick::save_slice(conn,revision,&slice,(10,10)).unwrap(); slices.push(slice);
+    }
+    let reference=QuickReadReference { schema_version:"v1".into(), source_digest:quick::source_digest(&sources), source_kind:crate::core::quick_read::QuickReadSourceKind::LocalFullText, source_provenance:vec![], provider_id:1, model:"extract".into(), prompt_version:"v1".into(), chapter_summaries:crate::core::quick_read::canonical_chapter_summaries(&slices), characters:vec![QuickReadCharacterCard { id:"hero".into(), name:"顾岚".into(), aliases:vec![], identity_evidence:vec!["守城".into()], motivations:vec!["保护边城".into()], narrative_roles:vec!["主角".into()], first_appearance_chapter:1, revelations:vec![], source_chapters:vec![1,2,3] }], plot_summary:"守城主线".into(), plot_notes:vec![], completed_spans:slices.iter().flat_map(|slice|slice.source_spans.clone()).collect() };
+    quick::publish_reference(conn,revision,&reference).unwrap();
+    for chapter in 1..=2 {
+        let text=repo::text_version(conn,book,chapter,"original",None).unwrap();
+        let snapshot=crate::core::kg::ChapterSnapshot { summary:format!("原作记忆{chapter}"), ..Default::default() };
+        let (_,extraction_config)=crate::commands::kg::runtime_config(conn,None).unwrap();
+        repo::commit_snapshot(conn,&text,&snapshot,"bootstrap",repo::line_version(conn,book).unwrap(),None,&extraction_config).unwrap();
+        crate::store::story_projection::save_chapter_memory(conn,&text,&snapshot,"bootstrap").unwrap();
+    }
 }
-fn config()->RuntimeConfig {
-    RuntimeConfig {provider_id:1,model_extract:"extract".into(),context_limit:32768,output_reserve:4096,prompt_version:"kg-lite/v1".into()}
+fn plan(conn:&Connection,book:i64,chapter:i64) {
+    let wiki=NextChapterWiki { chapter_idx:chapter, goals:vec!["继续守城".into()], state_directions:vec![], open_threads:vec![], avoid:vec![], ending_direction:"留下线索".into(), related_entry_ids:vec![] };
+    crate::commands::story::save_test_next_wiki(conn,book,chapter,&wiki).unwrap();
 }
-fn database()->(Connection,i64) {
-    use crate::store::{Db,books::{create_book_with_chapters,NewChapter}};
-    let conn=Connection::open_in_memory().unwrap();Db::apply_pragmas(&conn).unwrap();Db::new(&conn).migrate().unwrap();
-    let chapters=(1..=5).map(|idx|NewChapter {idx,title:format!("章{idx}"),text:format!("原作第{idx}章"),token_est:20}).collect::<Vec<_>>();
-    let book=create_book_with_chapters(&conn,"生成测试",None,"txt","test",&chapters).unwrap();
-    repo::mark_read(&conn,book,1).unwrap();(conn,book)
+fn pair(chapter:i64) -> Value {
+    json!({"prose":format!("改写第{chapter}章完整正文：顾岚主动安排撤离，保护边城百姓。"),"actual_chapter_wiki":{"chapter_idx":chapter,"chapter":{"headline":"安排撤离","narrative":"顾岚主动安排撤离。","ending":{"open_threads":[]}},"entries":[{"id":"hero","kind":"character","name":"顾岚","aliases":[],"summary":"守护边城","state_items":["安排撤离"],"related_entries":[],"open_threads":[],"source_chapters":[chapter]}]}})
 }
-fn directive(book:i64,text:&str)->EditInput {
-    EditInput {book_id:book,scope:"global".into(),chapter_idx:None,kind:"directive".into(),action:"upsert".into(),key:None,data:json!({"text":text})}
+struct PairedClient {
+    calls:AtomicUsize,
+    prompts:parking_lot::Mutex<Vec<Value>>,
+    malformed:AtomicBool,
+    cancelled:AtomicBool,
+    cancel_after_response:AtomicBool,
 }
-fn provider()->ProviderConfig {
-    ProviderConfig {id:1,name:"recorded".into(),protocol:"openai".into(),base_url:"http://recorded".into(),
-        model_extract:Some("extract".into()),model_write:Some("write".into()),model_merge:Some("merge".into()),api_key:String::new()}
-}
-// Fixed, independent chapter replies exercise persistence/resume, not prompt echo behavior.
-struct RecordedClient {writes:AtomicUsize,extracts:AtomicUsize,merges:AtomicUsize,fail_extract:AtomicBool,fail_merge:AtomicBool}
-impl RecordedClient {
-    fn new()->Self {Self {writes:AtomicUsize::new(0),extracts:AtomicUsize::new(0),merges:AtomicUsize::new(0),fail_extract:AtomicBool::new(false),fail_merge:AtomicBool::new(false)}}
+impl PairedClient {
+    fn new()->Self { Self { calls:AtomicUsize::new(0), prompts:parking_lot::Mutex::new(vec![]), malformed:AtomicBool::new(false), cancelled:AtomicBool::new(false), cancel_after_response:AtomicBool::new(false) } }
 }
 #[async_trait::async_trait]
-impl LlmClient for RecordedClient {
-    async fn structured(&self,req:StructuredRequest<'_>)->Result<Value,crate::llm::LlmError> {
-        match req.task {
-            TaskKind::Extract=>{self.extracts.fetch_add(1,Ordering::SeqCst);if self.fail_extract.swap(false,Ordering::SeqCst){return Err(crate::llm::LlmError::Network("extraction outage".into()));}},
-            TaskKind::Merge=>{self.merges.fetch_add(1,Ordering::SeqCst);if self.writes.load(Ordering::SeqCst)>0&&self.fail_merge.swap(false,Ordering::SeqCst){return Err(crate::llm::LlmError::Network("reconciliation outage".into()));}},
-            _=>return Err(crate::llm::LlmError::Schema("unexpected structured task".into()))
-        }
-        Ok(json!({"summary":"已完成章节摘要","entities":[],"relations":[],"events":[],"open_threads":[]}))
+impl LlmClient for PairedClient {
+    async fn structured_with_usage(&self,request:StructuredRequest<'_>)->Result<crate::llm::StructuredResponse,crate::llm::LlmError> {
+        assert_eq!(request.task,TaskKind::Write);
+        let input:Value=serde_json::from_str(&request.messages[1].content).unwrap();
+        let chapter=input["chapter_idx"].as_i64().unwrap();
+        self.prompts.lock().push(input); self.calls.fetch_add(1,Ordering::SeqCst);
+        let mut value=pair(chapter);
+        if self.malformed.swap(false,Ordering::SeqCst) { value["actual_chapter_wiki"]["chapter_idx"]=json!(chapter+1); }
+        if self.cancel_after_response.load(Ordering::SeqCst) { self.cancelled.store(true,Ordering::SeqCst); }
+        Ok(crate::llm::StructuredResponse { value, usage:Some((100,100)) })
     }
-    async fn structured_with_usage(&self,req:StructuredRequest<'_>)->Result<crate::llm::StructuredResponse,crate::llm::LlmError> {
-        Ok(crate::llm::StructuredResponse {value:self.structured(req).await?,usage:None})
+    fn check_cancelled(&self)->Result<(),crate::llm::LlmError> {
+        if self.cancelled.load(Ordering::SeqCst) { Err(crate::llm::LlmError::Cancelled) } else { Ok(()) }
     }
-    async fn stream_text(&self,_req:TextRequest,on_delta:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,crate::llm::LlmError> {
-        let number=self.writes.fetch_add(1,Ordering::SeqCst)+1;let text=format!("实际生成正文{number}");on_delta(&text);Ok(text)
-    }
+    async fn stream_text(&self,_request:crate::llm::TextRequest,_delta:Arc<dyn for<'a> Fn(&'a str)+Send+Sync>)->Result<String,crate::llm::LlmError> { panic!("paired rewrite cannot stream prose") }
 }
 
-#[test]
-fn revert_digest_ignores_runtime_counters_but_tracks_real_state_and_prose() {
-    let original=context();let mut revived=original.clone();revived.reading_line_version=9;
-    revived.actual.reading_line_version=9;revived.actual.revision=Some(88);revived.actual.ready=false;
-    revived.actual.coverage.calls_used=45;revived.spec.coverage.elapsed_ms=480000;
-    let baseline=dependency_digest(&original,&config(),&json!({})).unwrap();
-    assert_eq!(baseline,dependency_digest(&revived,&config(),&json!({})).unwrap());
-    revived.previous_text.push_str("内容改变");assert_ne!(baseline,dependency_digest(&revived,&config(),&json!({})).unwrap());
-    revived=original.clone();revived.actual.nodes.push(node("a","甲",1,"ai_original"));
-    assert_ne!(baseline,dependency_digest(&revived,&config(),&json!({})).unwrap());
-}
-#[test]
-fn essential_actual_prose_and_negative_intent_survive_reference_budgeting() {
-    let mut ctx=context();ctx.reference_text=Some("未来秘密".repeat(10000));
-    let hard=json!({"intent_constraints":{"tombstones":[{"kind":"event","key":"forbidden"}],"directives":[{"polarity":"negative","text":"信使死亡"}]}});
-    let messages=write_messages(&ctx,&config(),&hard,&view("actual",1)).unwrap();let prompt=&messages[1].content;
-    assert!(prompt.contains("已发生的选中正文")&&prompt.contains("negative")&&prompt.contains("forbidden"));
-    assert!(!prompt.contains(&"未来秘密".repeat(10000)));
-    let mut tiny=config();tiny.context_limit=5;assert!(write_messages(&ctx,&tiny,&hard,&view("actual",1)).is_err());
-    assert_ne!(dependency_digest(&ctx,&config(),&hard).unwrap(),dependency_digest(&ctx,&config(),&json!({})).unwrap());
-}
-#[test]
-fn future_tombstones_do_not_delete_actual_history_or_leave_dangling_state() {
-    let mut spec=view("spec",2);spec.nodes.push(node("excluded","甲",2,"ai_original"));
-    let mut item=node("item","信件",2,"ai_original");item.entity_type="item".into();item.owner=Some("excluded".into());
-    spec.nodes.push(item);spec.events.push(event("delivery","excluded"));let actual=spec.clone();
-    apply_tombstones(&mut spec,&json!({"tombstones":[{"kind":"node","key":"excluded"}]}));
-    assert_eq!(spec.nodes.len(),1);assert!(spec.nodes[0].owner.is_none());assert!(spec.events.is_empty());
-    assert_eq!(actual.nodes.len(),2);assert_eq!(actual.events.len(),1);
-}
-#[test]
-fn deleted_alias_cannot_return_under_a_new_future_key() {
-    let mut ctx=context();let mut deleted=node("deleted","甲",2,"ai_original");deleted.aliases.push("别名".into());ctx.spec.nodes.push(deleted);
-    let mut intent=json!({"tombstones":[{"kind":"node","key":"deleted"}]});enrich_tombstones(&mut intent,&ctx.spec,&ctx.actual);
-    apply_tombstones(&mut ctx.spec,&intent);
-    let result=ChapterSnapshot {nodes:vec![node("spec-renamed-opaque-id","别名",2,"ai_adapted")],..ChapterSnapshot::default()};
-    assert!(validate_spec(&result,&ctx,&json!({"intent_constraints":intent})).unwrap_err().contains("删除"));
-}
-#[test]
-fn user_future_state_overrides_model_including_explicit_null() {
-    let mut adapted=view("spec",2);let mut proposed=node("a","模型名字",2,"ai_adapted");proposed.location=Some("place".into());adapted.nodes.push(proposed);
-    let mut input=view("spec",2);input.nodes.push(node("a","用户名字",2,"user"));overlay_user(&mut adapted,&input);
-    assert_eq!(adapted.nodes[0].name,"用户名字");assert_eq!(adapted.nodes[0].location,None);assert_eq!(adapted.nodes[0].provenance,"user");
-}
-#[test]
-fn reconciliation_uses_short_refs_and_opaque_future_only_ids() {
-    let mut ctx=context();ctx.actual.nodes.push(node("actual-secret-key","甲",1,"ai_original"));
-    let known=reconcile_registry(&ctx);let mut messages=write_messages(&ctx,&config(),&json!({}),&view("actual",1)).unwrap();
-    prepare_merge_messages(&mut messages,&known);let input:Value=serde_json::from_str(&messages[1].content).unwrap();
-    assert_eq!(input["known_entities"][0]["ref"],"k0");assert_eq!(input["actual"]["nodes"][0]["key"],"k0");
-    let text=TextVersion {id:0,book_id:1,chapter_idx:2,source:"spec".into(),content:String::new(),content_hash:"deps".into(),generated_id:None};
-    let result=crate::core::kg_extract::decode_graph(json!({"summary":"规格","entities":[{"ref":"new","type":"item","name":"秘密信物","aliases":[],"description":"赠送给甲的信物","life_status":null,"location":null,"owner":"k0"}],
-        "relations":[],"events":[{"title":"赠送","participants":["k0","new"],"location":null,"time":null,"summary":"交付信物"}],"open_threads":[]}),&text,&known,"ai_adapted").unwrap();
-    let item=result.nodes.iter().find(|n|n.name=="秘密信物").unwrap();assert!(item.key.starts_with("spec-"));assert!(!item.key.contains("秘密"));
-    assert_eq!(item.owner.as_deref(),Some("actual-secret-key"));assert!(result.events[0].participants.contains(&item.key));
-}
-#[test]
-fn drift_compares_known_life_owner_location_relations_and_event_time() {
-    let mut reference=view("reference",2);let mut hero=node("a","甲",2,"ai_original");hero.life_status=Some("alive".into());reference.nodes.push(hero);
-    let mut actual=reference.clone();actual.nodes[0].life_status=Some("dead".into());assert!(actual_diff(&actual,&reference)>0.0);
-    reference.nodes[0].entity_type="item".into();reference.nodes[0].life_status=None;actual=reference.clone();actual.nodes[0].owner=Some("b".into());assert!(actual_diff(&actual,&reference)>0.0);
-    actual=reference.clone();actual.nodes[0].location=Some("p".into());assert!(actual_diff(&actual,&reference)>0.0);
-    reference.events.push(event("e","a"));actual=reference.clone();actual.events[0].time=Some("夜晚".into());assert!(actual_diff(&actual,&reference)>0.0);
-    actual=reference.clone();actual.nodes.push(actual.nodes[0].clone());assert_eq!(actual_diff(&actual,&reference),0.0);
-}
-#[test]
-fn missing_stages_and_stale_readable_recovery_are_guarded() {
-    assert_eq!(resume_stage(false,false),ResumeStage::Extract);assert_eq!(resume_stage(true,false),ResumeStage::Reconcile);assert_eq!(resume_stage(true,true),ResumeStage::Complete);
-    assert!(completed_stage_error("[kg:prose-saved:extract] failed"));assert!(completed_stage_error("[kg:prose-saved:reconcile] failed"));assert!(!completed_stage_error("正文生成失败"));
-    let (conn,book)=database();repo::edit(&conn,&directive(book,"改写")).unwrap();let line=repo::line_version(&conn,book).unwrap();
-    let saved=repo::save_generated(&conn,book,2,"保存正文","write","deps",line).unwrap();
-    assert_eq!(saved_readable_after_stage_error(&conn,book,2,line).unwrap().unwrap().id,saved.id);
-    repo::edit(&conn,&directive(book,"另一意图")).unwrap();assert!(saved_readable_after_stage_error(&conn,book,2,line).is_err());
-    assert!(repo::save_generated(&conn,book,2,"过时正文","write","old",line).is_err());
-}
 #[tokio::test]
-async fn ready_story_plan_generates_selected_next_chapter() {
+async fn paired_generation_requires_quick_read_and_current_original_bootstrap() {
     let (conn,book)=database();
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    assert!(ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.is_err());
+    assert_eq!(client.calls.load(Ordering::SeqCst),0);
+    db(&state,|conn| { bootstrap(conn,book); plan(conn,book,2); Ok(()) }).unwrap();
+    let mut changed=config(); changed.model_extract="changed-extractor".into();
+    assert!(ensure_rewritten_chapter(&state,&client,&provider(),&changed,book,2,None).await.is_err());
+    assert_eq!(client.calls.load(Ordering::SeqCst),0);
+    let generated=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    db(&state,|conn| {
+        assert_eq!(repo::selected_text(conn,book,2)?.unwrap().id,generated.id);
+        assert!(crate::store::story_projection::text_memory_ready(conn,generated.id)?);
+        assert_eq!(repo::progress(conn,book)?,1);
+        assert!(crate::store::story_projection::active_chapter_memory(conn,book,2)?.is_none());
+        repo::mark_read(conn,book,2)?;
+        let actual=crate::store::story_projection::active_chapter_memory(conn,book,2)?.unwrap();
+        assert_eq!(actual["text_version_id"],generated.id);
+        assert_eq!(actual["chapter"]["narrative"],"顾岚主动安排撤离。");
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn paired_generation_uses_selected_generated_predecessor_and_hidden_original_target() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    let chapter2=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    db(&state,|conn| { repo::mark_read(conn,book,2)?; plan(conn,book,3); Ok(()) }).unwrap();
+    let chapter3=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,3,None).await.unwrap();
+    let prompts=client.prompts.lock();
+    assert_eq!(prompts[0]["original_target_wiki"]["chapter_idx"],2);
+    assert_eq!(prompts[1]["previous_selected_full_text"],chapter2.content);
+    assert!(prompts[1]["original_target_chapter"].as_str().unwrap().contains("原作第3章完整正文"));
+    assert_eq!(prompts[1]["actual_history"]["entries"][0]["state_items"][0],"安排撤离");
+    assert_eq!(prompts[1]["quick_read"]["characters"][0]["name"],"顾岚");
+    assert_eq!(chapter3.source,"generated");
+}
+
+#[tokio::test]
+async fn malformed_pair_does_not_publish_text_or_wiki_and_cache_needs_complete_pair() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new(); client.malformed.store(true,Ordering::SeqCst);
+    assert!(ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.is_err());
+    db(&state,|conn| { assert_eq!(repo::selected_text(conn,book,2)?.unwrap().source,"original"); Ok(()) }).unwrap();
+    let saved=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    let cached=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    assert_eq!(saved.id,cached.id); assert_eq!(client.calls.load(Ordering::SeqCst),2);
+    db(&state,|conn| { conn.execute("UPDATE story_chapter_revisions SET active=0 WHERE text_version_id=?1",[saved.id]).map_err(|e|e.to_string())?; Ok(()) }).unwrap();
+    ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    assert_eq!(client.calls.load(Ordering::SeqCst),3);
+}
+
+#[tokio::test]
+async fn free_text_without_question_batch_reaches_writer_and_invalidates_cached_pair() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    db(&state,|conn| { story_repo::save_intervention(conn,&crate::core::story::InterventionInput { book_id:book, chapter_idx:2, batch_index:None, question_batch_id:None, selected_option_ids:vec![], free_text:Some("顾岚带百姓离城，不再守城".into()), overridden_option_ids:vec![], reading_line_version:repo::line_version(conn,book)? })?; Ok(()) }).unwrap();
+    db(&state,|conn| { assert!(repo::active_generated_text(conn,book,2)?.is_none(),"edited intervention must invalidate the previous active rewrite"); Ok(()) }).unwrap();
+    db(&state,|conn| { plan(conn,book,2); Ok(()) }).unwrap();
+    ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,None).await.unwrap();
+    assert_eq!(client.calls.load(Ordering::SeqCst),2);
+    assert!(client.prompts.lock()[1]["next_chapter_wiki"]["user_free_text"].to_string().contains("顾岚带百姓离城"));
+}
+
+#[tokio::test]
+async fn recovery_reuses_staged_complete_pair_without_provider_call() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let prepared=prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap();
+    let job=crate::jobs::enqueue(&conn,book,crate::jobs::JobKind::Generate,json!({"chapter_idx":2,"paired_draft":{"dependency_digest":prepared.dependency_digest,"result":pair(2)}})).unwrap();
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    let generated=ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,Some(job)).await.unwrap();
+    assert_eq!(client.calls.load(Ordering::SeqCst),0);
+    db(&state,|conn| { let checkpoint=repo::job_checkpoint(conn,job)?; assert_eq!(checkpoint["paired_commit"]["text_version_id"],generated.id); assert!(crate::store::story_projection::text_memory_ready(conn,generated.id)?); Ok(()) }).unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_job_cannot_publish_a_staged_pair() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let prepared=prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap();
+    let job=crate::jobs::enqueue(&conn,book,crate::jobs::JobKind::Generate,json!({"chapter_idx":2,"paired_draft":{"dependency_digest":prepared.dependency_digest,"result":pair(2)}})).unwrap();
+    crate::jobs::mark_cancelled(&conn,job).unwrap();
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    assert!(ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,Some(job)).await.is_err());
+    assert_eq!(client.calls.load(Ordering::SeqCst),0);
+    db(&state,|conn| { assert_eq!(repo::selected_text(conn,book,2)?.unwrap().source,"original"); Ok(()) }).unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_after_provider_response_preserves_original_selection() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let job=crate::jobs::enqueue(&conn,book,crate::jobs::JobKind::Generate,json!({"chapter_idx":2})).unwrap();
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    client.cancel_after_response.store(true,Ordering::SeqCst);
+    assert!(ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,Some(job)).await.is_err());
+    assert_eq!(client.calls.load(Ordering::SeqCst),1);
+    db(&state,|conn| { assert_eq!(repo::selected_text(conn,book,2)?.unwrap().source,"original"); assert!(repo::job_checkpoint(conn,job)?["paired_commit"].is_null()); Ok(()) }).unwrap();
+}
+
+#[tokio::test]
+async fn explicit_retry_reuses_failed_job_complete_draft() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let prepared=prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap();
+    let failed=crate::jobs::enqueue(&conn,book,crate::jobs::JobKind::Generate,json!({"chapter_idx":2,"paired_draft":{"dependency_digest":prepared.dependency_digest,"result":pair(2)}})).unwrap();
+    crate::jobs::mark_failed(&conn,failed,"activation interrupted").unwrap();
+    let retry=crate::jobs::enqueue(&conn,book,crate::jobs::JobKind::Generate,json!({"chapter_idx":2})).unwrap();
+    let state=AppState { db:parking_lot::Mutex::new(Some(conn)) }; let client=PairedClient::new();
+    ensure_rewritten_chapter(&state,&client,&provider(),&config(),book,2,Some(retry)).await.unwrap();
+    assert_eq!(client.calls.load(Ordering::SeqCst),0);
+}
+
+#[test]
+fn paired_digest_tracks_original_reference_revision_and_selected_previous_memory() {
+    let (conn,book)=database(); bootstrap(&conn,book); plan(&conn,book,2);
+    let baseline=prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap().dependency_digest;
+    let original=repo::text_version(&conn,book,2,"original",None).unwrap();
+    let snapshot=crate::core::kg::ChapterSnapshot { summary:"更新的隐藏原作记忆".into(), ..Default::default() };
+    crate::store::story_projection::save_chapter_memory(&conn,&original,&snapshot,"reference-refresh").unwrap();
+    assert!(prepare_rewrite(&conn,book,2,&provider(),&config()).is_err());
+    plan(&conn,book,2);
+    let refreshed=prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap().dependency_digest;
+    assert_ne!(baseline,refreshed);
     let previous=repo::selected_text(&conn,book,1).unwrap().unwrap();
-    let wiki=crate::core::story::NextChapterWiki { chapter_idx:2, goals:vec!["继续调查".into()], state_directions:vec![], open_threads:vec![], avoid:vec![], ending_direction:"留下线索".into(), related_entry_ids:vec![] };
-    crate::store::story::save_next_wiki(&conn,book,2,previous.id,1,"plan",&wiki).unwrap();
-    let state=AppState {db:parking_lot::Mutex::new(Some(conn))};let client=RecordedClient::new();
-    let generated=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();
-    assert_eq!(generated.source,"generated");
-    assert_eq!(client.writes.load(Ordering::SeqCst),1);
-} 
-
-#[tokio::test]
-async fn original_jump_extracts_only_requested_chapter() {
-    let (conn,book)=database();let state=AppState {db:parking_lot::Mutex::new(Some(conn))};let client=RecordedClient::new();
-    let text=ensure_chapter(&state,&client,&provider(),&config(),book,5,Arc::new(|_|{})).await.unwrap();assert_eq!(text.source,"original");
-    assert_eq!(client.extracts.load(Ordering::SeqCst),1);assert_eq!(client.writes.load(Ordering::SeqCst),0);
-    let actual=db(&state,|c|repo::internal_view(c,&query(book,"actual",5,"global"))).unwrap();assert!(actual.coverage.missing_chapters.contains(&2));
-}
-#[tokio::test]
-async fn backextract_failure_resumes_missing_stage_without_rewriting_text() {
-    let (conn,book)=database();repo::edit(&conn,&directive(book,"改变剧情")).unwrap();let state=AppState {db:parking_lot::Mutex::new(Some(conn))};
-    let client=RecordedClient::new();client.fail_extract.store(true,Ordering::SeqCst);
-    let error=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap_err();assert!(completed_stage_error(&error));
-    let saved=db(&state,|c|repo::selected_text(c,book,2)).unwrap().unwrap();assert!(!db(&state,|c|repo::ready(c,saved.id)).unwrap());
-    let retried=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();
-    assert_eq!(retried.id,saved.id);assert_eq!(retried.content,saved.content);assert_eq!(client.writes.load(Ordering::SeqCst),1);
-}
-#[tokio::test]
-async fn reconcile_failure_resumes_without_rewriting_or_reextracting() {
-    let (conn,book)=database();repo::edit(&conn,&directive(book,"改变剧情")).unwrap();let state=AppState {db:parking_lot::Mutex::new(Some(conn))};
-    let client=RecordedClient::new();client.fail_merge.store(true,Ordering::SeqCst);
-    let error=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap_err();assert!(error.starts_with("[kg:prose-saved:reconcile]"));
-    let saved=db(&state,|c|repo::selected_text(c,book,2)).unwrap().unwrap();assert!(db(&state,|c|repo::ready(c,saved.id)).unwrap());
-    let retried=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();assert_eq!(saved.id,retried.id);
-    assert_eq!(client.writes.load(Ordering::SeqCst),1);assert_eq!(client.extracts.load(Ordering::SeqCst),1);
-}
-#[tokio::test]
-async fn generated_jump_builds_only_selected_generated_predecessors() {
-    let (conn,book)=database();repo::edit(&conn,&directive(book,"改变剧情")).unwrap();let state=AppState {db:parking_lot::Mutex::new(Some(conn))};let client=RecordedClient::new();
-    let generated=ensure_chapter(&state,&client,&provider(),&config(),book,4,Arc::new(|_|{})).await.unwrap();assert_eq!(generated.source,"generated");
-    assert_eq!(client.writes.load(Ordering::SeqCst),3);assert_eq!(client.extracts.load(Ordering::SeqCst),3);
-    db(&state,|c|{for idx in 2..=4 {assert_eq!(repo::selected_text(c,book,idx)?.unwrap().source,"generated");}Ok(())}).unwrap();
-}
-#[tokio::test]
-async fn reverting_temporary_intent_revives_cached_text_and_snapshot() {
-    let (conn,book)=database();repo::edit(&conn,&directive(book,"保留信使")).unwrap();let state=AppState {db:parking_lot::Mutex::new(Some(conn))};let client=RecordedClient::new();
-    let first=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();
-    let temporary=db(&state,|c|repo::edit(c,&directive(book,"改变路线"))).unwrap();
-    let changed=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();assert_ne!(first.id,changed.id);
-    db(&state,|c|repo::revert(c,book,temporary)).unwrap();let revived=ensure_chapter(&state,&client,&provider(),&config(),book,2,Arc::new(|_|{})).await.unwrap();
-    assert_eq!(first.id,revived.id);assert!(db(&state,|c|repo::ready(c,revived.id)).unwrap());assert_eq!(client.writes.load(Ordering::SeqCst),2);
+    crate::store::story_projection::save_chapter_memory(&conn,&previous,&crate::core::kg::ChapterSnapshot { summary:"更新的实际前章记忆".into(), ..Default::default() },"actual-refresh").unwrap();
+    assert!(prepare_rewrite(&conn,book,2,&provider(),&config()).is_err());
+    plan(&conn,book,2);
+    assert_ne!(refreshed,prepare_rewrite(&conn,book,2,&provider(),&config()).unwrap().dependency_digest);
 }
 
 #[test]
-fn imported_actual_endpoints_keep_history_metadata_in_future_specs() {
-    let mut ctx=context();ctx.actual.nodes.push(node("actual","甲",1,"ai_original"));
-    let snapshot=ChapterSnapshot {nodes:ctx.actual.nodes.clone(),events:vec![event("future","actual")],..ChapterSnapshot::default()};
-    assert!(validate_spec(&snapshot,&ctx,&json!({})).is_ok());
-    assert_eq!(snapshot.nodes[0].chapter_idx,1);assert_eq!(snapshot.nodes[0].provenance,"ai_original");
-}
-#[test]
-fn deleted_event_content_cannot_return_under_a_different_record_key() {
-    let mut ctx=context();ctx.spec.nodes.push(node("a","甲",2,"ai_original"));ctx.spec.events.push(event("deleted","a"));
-    let mut intent=json!({"tombstones":[{"kind":"event","key":"deleted"}]});enrich_tombstones(&mut intent,&ctx.spec,&ctx.actual);
-    let mut restored=ctx.spec.events[0].clone();restored.key="e-new-model-key".into();
-    let snapshot=ChapterSnapshot {nodes:ctx.spec.nodes.clone(),events:vec![restored],..ChapterSnapshot::default()};
-    assert!(validate_spec(&snapshot,&ctx,&json!({"intent_constraints":intent})).unwrap_err().contains("删除"));
-}
-#[test]
-fn sparse_original_dependencies_do_not_require_past_graphs_or_fallback_after_divergence() {
-    let (conn,book)=database();assert!(actual_dependencies(&conn,book,4).is_ok());
-    repo::edit(&conn,&directive(book,"改写")).unwrap();
-    assert!(actual_dependencies(&conn,book,2).unwrap_err().contains("不能使用原作替代"));
-    assert_eq!(divergence_from_edits(&[EditRecord {id:99,target_type:"directive".into(),target_id:"x".into(),action:"upsert".into(),after_json:None,effective_from:1,active:true}]),Some(2));
-}
-#[test]
-fn persisted_negative_polarity_and_deleted_user_node_reach_generation_intent() {
-    let (conn,book)=database();repo::edit(&conn,&EditInput {book_id:book,scope:"global".into(),chapter_idx:None,
-        kind:"node".into(),action:"upsert".into(),key:None,data:json!({"name":"不应重现的角色"})}).unwrap();
-    let public=repo::get_view(&conn,&query(book,"spec",2,"global")).unwrap().nodes[0].key.clone();
-    let internal=repo::internal_view(&conn,&query(book,"spec",2,"global")).unwrap().nodes[0].key.clone();
-    repo::edit(&conn,&EditInput {book_id:book,scope:"global".into(),chapter_idx:None,kind:"node".into(),action:"delete".into(),key:Some(public),data:json!({})}).unwrap();
-    repo::edit(&conn,&EditInput {data:json!({"text":"信使死亡","polarity":"negative"}),..directive(book,"信使死亡")}).unwrap();
-    let intent=repo::intent_constraints(&conn,book,2).unwrap();assert!(tombstone_keys(&intent,"node").contains(internal.as_str()));
-    assert!(intent["directives"].as_array().unwrap().iter().any(|d|d["polarity"]=="negative"&&d["text"]=="信使死亡"));
-    let prompt=write_messages(&context(),&config(),&json!({"intent_constraints":intent}),&view("actual",1)).unwrap();
-    assert!(prompt[1].content.contains(&internal));assert!(prompt[1].content.contains("negative"));
+fn paired_decoder_qualifies_links_against_selected_actual_history_only() {
+    let mut value=pair(3);
+    value["actual_chapter_wiki"]["entries"][0]["related_entries"]=json!(["prior-selected-character"]);
+    assert!(decode_rewrite_result(value.clone(),3).is_err());
+    let selected=BTreeSet::from(["prior-selected-character".to_owned()]);
+    assert!(decode_rewrite_result_with_history(value.clone(),3,&selected).is_ok());
+    value["actual_chapter_wiki"]["entries"][0]["related_entries"]=json!(["hidden-original-secret"]);
+    assert!(decode_rewrite_result_with_history(value,3,&selected).is_err());
 }

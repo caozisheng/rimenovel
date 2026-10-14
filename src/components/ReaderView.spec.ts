@@ -2,7 +2,7 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ReaderView from "./ReaderView.vue";
 
-const backend = vi.hoisted(() => ({ invoke: vi.fn(), history: [] as Record<string, unknown>[], version: 7, noBatch: false, batchError: false, overridden: [] as string[], listeners: new Map<string, (event: { payload: unknown }) => void>() }));
+const backend = vi.hoisted(() => ({ invoke: vi.fn(), history: [] as Record<string, unknown>[], version: 7, noBatch: false, batchError: false, overridden: [] as string[], statuses: [] as Record<string, unknown>[], listeners: new Map<string, (event: { payload: unknown }) => void>() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: backend.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: async (name: string, callback: (event: { payload: unknown }) => void) => { backend.listeners.set(name, callback); return () => backend.listeners.delete(name); } }));
 const mounted: VueWrapper[] = [];
@@ -13,8 +13,11 @@ async function openWiki(wrapper: VueWrapper) { await flushPromises(); await wrap
 beforeEach(() => {
   localStorage.clear();
   backend.history = []; backend.version = 7; backend.noBatch = false; backend.batchError = false; backend.overridden = []; backend.listeners.clear(); backend.invoke.mockReset();
+  backend.statuses = [{ book_id: 1, kind: "bootstrap_wiki", state: "done", stage: "bootstrap_wiki", progress: 1, quick_read_ready: true, bootstrap_ready: true, completed_chapters: 2, total_chapters: 2 }];
   vi.spyOn(window, "scrollTo").mockImplementation(() => {});
   backend.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    if (command === "get_extraction_statuses") return backend.statuses;
+    if (command === "start_quick_read") return 17;
     if (command === "get_chapter_titles") return [{ idx: 1, title: "第一章", char_count: 20 }, { idx: 2, title: "第二章", char_count: 20 }];
     if (command === "get_chapter_cmd") return { idx: args?.idx, title: args?.idx === 1 ? "第一章" : "第二章", content: `第 ${args?.idx} 章正文`, source: "original", graph_error: null };
     if (command === "get_story_map") return { ...wiki, reading_line_version: backend.version };
@@ -94,5 +97,72 @@ describe("reader Wiki integration", () => {
     await flushPromises();
     expect(wrapper.get(".chapter-text").text()).toContain("保存的下一章正文");
     expect(wrapper.get(".pager").text()).toContain("2 / 2");
+  });
+  it("keeps original reading and free-text intervention available during full-book preparation", async () => {
+    backend.statuses = [{ book_id: 1, kind: "quick_read", state: "running", stage: "quick_read", progress: 0.5, completed_slices: 2, total_slices: 4, completed_chapters: 1, total_chapters: 2, quick_read_ready: false, bootstrap_ready: false, reference: { name: "未读人物秘密" } }];
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.get(".chapter-text").text()).toContain("第 1 章正文");
+    expect(wrapper.get('[aria-label="改写准备进度"]').text()).toContain("分片 2 / 4");
+    expect(wrapper.text()).toContain("原文仍可阅读");
+    expect(wrapper.text()).not.toContain("未读人物秘密");
+    expect(backend.invoke).not.toHaveBeenCalledWith("get_chapter_cmd", expect.objectContaining({ mode: "rewrite" }));
+    await openWiki(wrapper);
+    expect(wrapper.get('[data-action="end"]').attributes("disabled")).toBeUndefined();
+    await wrapper.get("textarea").setValue("一起离开");
+    await wrapper.get('[data-action="end"]').trigger("click"); await flushPromises();
+    expect(backend.invoke).toHaveBeenCalledWith("end_questionnaire", expect.objectContaining({ input: expect.objectContaining({ free_text: "一起离开" }) }));
+    expect(backend.invoke.mock.calls.some(([command]) => command === "get_question_batch")).toBe(false);
+  });
+  it("refreshes distinct bootstrap/readiness phases from job events without changing original prose", async () => {
+    backend.statuses = [{ book_id: 1, kind: "quick_read", state: "done", progress: 1, quick_read_ready: true, bootstrap_ready: false }];
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.text()).toContain("全书速读：已完成");
+    expect(wrapper.text()).toContain("原文前两章 Wiki：等待初始化");
+    expect(wrapper.text()).toContain("第二章改写：等待前置资料");
+    backend.statuses = [{ book_id: 1, kind: "bootstrap_wiki", state: "running", stage: "bootstrap_wiki", progress: 0.5, completed_chapters: 1, total_chapters: 2, quick_read_ready: true, bootstrap_ready: false }];
+    backend.listeners.get("job:progress")?.({ payload: backend.statuses[0] }); await flushPromises();
+    expect(wrapper.text()).toContain("Wiki 1 / 2");
+    backend.statuses = [{ ...backend.statuses[0], state: "done", progress: 1, completed_chapters: 2, bootstrap_ready: true }];
+    backend.listeners.get("job:progress")?.({ payload: backend.statuses[0] }); await flushPromises();
+    expect(wrapper.text()).toContain("第二章改写：前置资料就绪");
+    expect(wrapper.get(".chapter-text").text()).toContain("第 1 章正文");
+  });
+  it("recovers a failed Quick-read with the dedicated command and retained counts", async () => {
+    backend.statuses = [{ book_id: 1, kind: "quick_read", state: "failed", stage: "quick_read", phase: "summary", progress: 0.8, completed_slices: 4, total_slices: 4, quick_read_ready: false, bootstrap_ready: false, error: "HTTP 504" }];
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.text()).toContain("全书汇总");
+    expect(wrapper.text()).toContain("分片 4 / 4");
+    await wrapper.get('[data-action="retry-quick-read"]').trigger("click"); await flushPromises();
+    expect(backend.invoke).toHaveBeenCalledWith("start_quick_read", { bookId: 1 });
+    expect(backend.invoke.mock.calls.some(([command]) => command === "start_book_extraction")).toBe(false);
+  });
+  it("does not wait for preparation status before loading original chapters", async () => {
+    const invoke = backend.invoke.getMockImplementation()!;
+    let finishStatus!: (value: unknown) => void;
+    backend.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => command === "get_extraction_statuses" ? new Promise(resolve => { finishStatus = resolve; }) : invoke(command, args));
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.get(".chapter-text").text()).toContain("第 1 章正文");
+    finishStatus(backend.statuses); await flushPromises();
+  });
+  it("keeps a saved rewrite preference from generating against stale preparation", async () => {
+    localStorage.setItem("rn-reading-mode-1", "rewrite");
+    backend.statuses = [{ book_id: 1, kind: "bootstrap_wiki", state: "done", progress: 1, quick_read_ready: false, bootstrap_ready: false }];
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.get(".chapter-text").text()).toContain("第 1 章正文");
+    expect(wrapper.text()).toContain("第二章改写：等待前置资料");
+    expect(backend.invoke.mock.calls.some(([command, args]) => command === "get_chapter_cmd" && args?.mode === "rewrite")).toBe(false);
+    expect(localStorage.getItem("rn-reading-mode-1")).toBe("rewrite");
+  });
+  it("ignores an older preparation response after a newer ready result", async () => {
+    const invoke = backend.invoke.getMockImplementation()!;
+    let finishOlder!: (value: unknown) => void;
+    backend.invoke.mockImplementationOnce(() => new Promise(resolve => { finishOlder = resolve; }));
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.get(".chapter-text").text()).toContain("第 1 章正文");
+    backend.invoke.mockImplementation(invoke);
+    backend.listeners.get("job:progress")?.({ payload: backend.statuses[0] }); await flushPromises();
+    expect(wrapper.text()).toContain("第二章改写：前置资料就绪");
+    finishOlder([{ book_id: 1, kind: "quick_read", state: "running", progress: 0.2, quick_read_ready: false, bootstrap_ready: false }]); await flushPromises();
+    expect(wrapper.text()).toContain("第二章改写：前置资料就绪");
   });
 });

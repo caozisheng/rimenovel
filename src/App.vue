@@ -6,7 +6,8 @@ import ReaderView from "./components/ReaderView.vue";
 import ProviderPanel from "./components/ProviderPanel.vue";
 import { openPanel } from "./lib/providerPanel";
 import { deleteBook, importBook, listBooks, pickNovelFile } from "./lib/ipc";
-import { getExtractionStatuses, onKgEvent, parseJobStatus, startBookExtraction } from "./lib/kg";
+import { getExtractionStatuses, onKgEvent, parseJobStatus, startQuickRead } from "./lib/kg";
+import { canStartQuickRead, legacyJobLabel, preparationPhases, preparationProgress, rewritePreparationReady, safePreparationDiagnostics } from "./lib/graph";
 import { applyTheme, currentTheme, type ThemeMode } from "./lib/theme";
 import {
   NButton,
@@ -30,7 +31,6 @@ const deletingBookId = ref<number | null>(null);
 const pendingDeleteBook = ref<Book | null>(null);
 const showDeleteDialog = ref(false);
 const extraction = ref<Record<number, ExtractionStatus>>({});
-const jobStateLabels: Record<string, string> = { queued: "等待执行", running: "后台处理中", paused: "已暂停", failed: "任务失败", cancelled: "已取消" };
 const themeMode = ref<ThemeMode>(currentTheme());
 const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const systemDark = ref(colorScheme.matches);
@@ -40,6 +40,7 @@ function onSystemThemeChange(event: MediaQueryListEvent): void {
 colorScheme.addEventListener("change", onSystemThemeChange);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let stopJobProgress: (() => void) | null = null;
+let extractionToken = 0;
 
 // Naive UI 主题与 CSS 令牌同步: dark 显式, auto 跟随系统
 const naiveTheme = computed(() =>
@@ -69,12 +70,16 @@ function onThemeChange(mode: ThemeMode): void {
 }
 
 async function refreshExtraction(): Promise<void> {
-  try { extraction.value = Object.fromEntries((await getExtractionStatuses()).map((status) => [status.book_id, status])); }
+  const token = ++extractionToken;
+  try {
+    const statuses = await getExtractionStatuses();
+    if (token === extractionToken) extraction.value = Object.fromEntries(statuses.map(status => [status.book_id, status]));
+  }
   catch { /* 非 Tauri 环境忽略 */ }
 }
-async function retryExtraction(bookId: number): Promise<void> {
+async function retryQuickRead(bookId: number): Promise<void> {
   error.value = "";
-  try { await startBookExtraction(bookId); await refreshExtraction(); }
+  try { await startQuickRead(bookId); await refreshExtraction(); }
   catch (e) { error.value = String(e); }
 }
 
@@ -133,6 +138,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  extractionToken++;
   if (pollTimer !== null) clearInterval(pollTimer);
   stopJobProgress?.();
   colorScheme.removeEventListener("change", onSystemThemeChange);
@@ -170,23 +176,21 @@ onUnmounted(() => {
           <div class="card-main">
             <button class="book-title" @click="openBook(b)">{{ b.title }}</button>
             <span class="meta">{{ b.author ?? "佚名" }} · {{ b.format }}</span>
+            <div class="preparation" aria-label="改写准备进度" role="status">
+              <span v-for="phase in preparationPhases(extraction[b.id])" :key="phase">{{ phase }}</span>
+              <span v-if="preparationProgress(extraction[b.id])">{{ preparationProgress(extraction[b.id]) }}</span>
+              <span v-if="!rewritePreparationReady(extraction[b.id])">原文仍可阅读；改写需等待全书速读与原文 Wiki 初始化。</span>
+              <span v-for="diagnostic in safePreparationDiagnostics(extraction[b.id])" :key="diagnostic">{{ diagnostic }}</span>
+            </div>
+            <details v-if="extraction[b.id]?.quick_read_source === 'web_outline' && extraction[b.id]?.reference_sources?.length">
+              <summary>查看联网参考来源（可能含原作信息）</summary>
+              <ul><li v-for="source in extraction[b.id].reference_sources" :key="source.url"><a :href="source.url" target="_blank" rel="noopener noreferrer">{{ source.title }}</a></li></ul>
+            </details>
+            <span v-if="extraction[b.id]?.error" class="job-error" role="alert">{{ extraction[b.id].error }} · 已完成的准备结果保留，可恢复未完成阶段。</span>
           </div>
           <div class="card-actions">
-            <NTag
-              v-if="extraction[b.id]"
-              size="small"
-              :type="
-                extraction[b.id].state === 'done' ? 'success'
-                : extraction[b.id].state === 'failed' ? 'error'
-                : 'info'"
-              round
-            >
-              {{ extraction[b.id].state === "done"
-                ? (extraction[b.id].kind === 'global_extract' ? "整书图谱就绪" : "后台任务完成")
-                : `${jobStateLabels[extraction[b.id].state] ?? extraction[b.id].state} ${Math.round(extraction[b.id].progress * 100)}%` }}
-            </NTag>
-            <NButton v-if="extraction[b.id]?.state === 'failed'" size="small" type="warning" @click="retryExtraction(b.id)">重试抽取</NButton>
-            <span v-if="extraction[b.id]?.state === 'failed' && extraction[b.id]?.error" class="job-error">{{ extraction[b.id]?.error }}</span>
+            <NTag v-if="extraction[b.id] && legacyJobLabel(extraction[b.id])" size="small" :type="extraction[b.id].state === 'failed' ? 'error' : 'info'" round>{{ legacyJobLabel(extraction[b.id]) }}</NTag>
+            <NButton v-if="canStartQuickRead(extraction[b.id])" size="small" type="warning" data-action="retry-quick-read" @click="retryQuickRead(b.id)">{{ extraction[b.id]?.kind === 'quick_read' || extraction[b.id]?.kind === 'bootstrap_wiki' ? '恢复全书速读 / Wiki' : '开始全书速读' }}</NButton>
             <NButton
               size="small"
               quaternary
@@ -252,12 +256,14 @@ onUnmounted(() => {
 .delete-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .book-title { font: inherit; font-weight: 600; text-align: left; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; overflow-wrap: anywhere; }
 .book-title::after { content: ""; position: absolute; inset: 0; border-radius: var(--radius-md); }
+.card-main details { position: relative; z-index: 1; overflow-wrap: anywhere; }
 .book-title:hover { color: var(--color-accent); }
 .book-card:focus-within { outline: 2px solid var(--color-accent); outline-offset: 4px; }
 .book-title:focus-visible { outline: none; }
 .meta { color: var(--color-text-secondary); font-size: 0.9em; }
 .empty { margin-top: var(--space-xl); }
 .job-error { color: var(--color-danger); font-size: 12px; max-width: 220px; overflow-wrap: anywhere; }
+.preparation { display: grid; gap: 2px; margin-top: var(--space-xs); color: var(--color-text-secondary); font-size: 12px; }
 @media (max-width: 480px) {
   .bookshelf { padding: var(--space-md); }
   .shelf-header { gap: var(--space-sm); }

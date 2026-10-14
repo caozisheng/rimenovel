@@ -1,3 +1,5 @@
+import type { GraphJobStatus } from "./graph";
+
 // 与 Rust 侧 serde 结构对齐的前端类型
 export interface Book {
   id: number;
@@ -33,16 +35,7 @@ export interface ProviderRow {
   model_merge: string | null;
   context_limit: number | null;
   output_reserve: number | null;
+  tavily_enabled: boolean;
+  has_tavily_key: boolean;
 }
-export interface ExtractionStatus {
-  book_id: number;
-  job_id?: number | null;
-  kind?: string | null;
-  chapter_idx?: number | null;
-  state: string;
-  progress: number;
-  error?: string | null;
-  phase?: string | null;
-  attempt?: number | null;
-  retry_after_ms?: number | null;
-}
+export type ExtractionStatus = GraphJobStatus;

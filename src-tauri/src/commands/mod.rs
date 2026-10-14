@@ -41,7 +41,6 @@ fn derive_title(path: &Path, chapters: &[NewChapter]) -> String {
 
 #[tauri::command]
 pub fn import_book(app: tauri::AppHandle, state: tauri::State<AppState>, path: String) -> Result<i64, String> {
-    let budget_started_ms = kg::epoch_ms();
     let p = Path::new(&path);
     let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
     let opts = SplitOptions::default();
@@ -72,7 +71,7 @@ pub fn import_book(app: tauri::AppHandle, state: tauri::State<AppState>, path: S
         create_book_with_chapters(conn, &title, None, format, &path, &chapters)
             .map_err(|e| format!("入库失败: {e}"))?
     };
-    kg::schedule_book(app, id, None, budget_started_ms)?;
+    quick_read::schedule_quick_read(app, id, None)?;
     Ok(id)
 }
 
@@ -161,8 +160,12 @@ pub async fn get_chapter_cmd(
         if reading_mode == "original" {
             (title, false, line_version, original_text, "original".to_owned(), "ready".to_owned())
         } else if let Some(generated) = crate::store::kg::active_generated_text(conn, book_id, idx)? {
-            (title, false, line_version, generated.content, "generated".to_owned(), "ready".to_owned())
-        } else if crate::store::story::active_next_wiki(conn, book_id, idx)?.is_some() {
+            if crate::store::story_projection::text_memory_ready(conn, generated.id)? {
+                (title, false, line_version, generated.content, "generated".to_owned(), "ready".to_owned())
+            } else {
+                (title, false, line_version, String::new(), "rewrite".to_owned(), "unavailable".to_owned())
+            }
+        } else if crate::commands::story::eligible_next_wiki(conn, book_id, idx)?.is_some() {
             (title, true, line_version, String::new(), "rewrite".to_owned(), "generating".to_owned())
         } else if idx == 1 || !crate::store::kg::has_generated_before(conn, book_id, idx)? {
             (title, false, line_version, original_text, "original".to_owned(), "inherited".to_owned())
@@ -172,18 +175,7 @@ pub async fn get_chapter_cmd(
     };
     let mut graph_error = None;
     if needs_generation {
-        let selected = match kg::ensure_selected(&app, &state, book_id, idx, None).await {
-            Ok(text) => text,
-            Err(error) if crate::core::kg_generate::completed_stage_error(&error) => {
-                let saved = {
-                    let guard = state.db.lock();
-                    crate::core::kg_generate::saved_readable_after_stage_error(guard.as_ref().ok_or("数据库未初始化")?, book_id, idx, line_version)?
-                }.ok_or_else(|| error.clone())?;
-                graph_error = Some(error);
-                saved
-            }
-            Err(error) => return Err(error),
-        };
+        let selected = kg::ensure_selected(&app, &state, book_id, idx, None).await?;
         content = selected.content;
         source = selected.source;
         rewrite_status = "ready".into();
@@ -191,11 +183,12 @@ pub async fn get_chapter_cmd(
         let guard = state.db.lock();
         graph_error = original_graph_error(guard.as_ref().ok_or("数据库未初始化")?, book_id, idx)?;
     }
+
     {
         let guard = state.db.lock();
         let conn = guard.as_ref().ok_or("数据库未初始化")?;
         if crate::store::kg::line_version(conn, book_id)? != line_version { return Err("阅读线已变化，请重新打开本章".into()); }
-        if reading_mode == "original" { crate::store::kg::mark_read(conn, book_id, idx)?; }
+        if reading_mode == "original" || source == "generated" { crate::store::kg::mark_read(conn, book_id, idx)?; }
     }
     if reading_mode == "original" { kg::prefetch_next(app, book_id); }
     Ok(ChapterContent { idx, title, content, source, reading_mode, rewrite_status, graph_error })
@@ -251,3 +244,4 @@ pub mod providers;
 pub mod status;
 pub mod kg;
 pub mod story;
+pub mod quick_read;

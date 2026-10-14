@@ -5,7 +5,9 @@ import WikiWorkbench from "./WikiWorkbench.vue";
 import QuestionnairePanel from "./QuestionnairePanel.vue";
 import type { ChapterMeta, ReadingMode, RewriteStatus } from "../lib/types";
 import type { QuestionBatch, QuestionnaireAnswer, QuestionnaireRecord, QuestionnaireSubmission, WikiView } from "../lib/wiki";
-import { getChapter, onKgEvent, parseChapterDelta } from "../lib/kg";
+import { getChapter, getExtractionStatuses, onKgEvent, parseChapterDelta, parseJobStatus, startQuickRead } from "../lib/kg";
+import { canStartQuickRead, preparationPhases, preparationProgress, rewritePreparationReady } from "../lib/graph";
+import type { GraphJobStatus } from "../lib/graph";
 import { getChapterTitles } from "../lib/ipc";
 import { endQuestionnaire, getActiveInterventions, getQuestionBatch, getWikiView, saveIntervention } from "../lib/story";
 import { readingChapter, readingMode as savedReadingMode, saveReadingChapter, saveReadingMode } from "../lib/readingMode";
@@ -33,6 +35,12 @@ const questionLoading = ref(false);
 const questionError = ref("");
 const submitting = ref(false);
 const records = ref<QuestionnaireRecord[]>([]);
+const preparation = ref<GraphJobStatus | null>(null);
+const preparationError = ref("");
+const retryingPreparation = ref(false);
+const rewriteReady = computed(() => rewritePreparationReady(preparation.value));
+const preparationLabels = computed(() => preparationPhases(preparation.value, titles.value.length));
+const preparationDetails = computed(() => preparationProgress(preparation.value));
 const nextChapterIdx = computed(() => currentIdx.value + 1);
 const hasNextChapter = computed(() => nextChapterIdx.value <= titles.value.length);
 const chapterRecords = new Map<number, QuestionnaireRecord[]>();
@@ -40,17 +48,41 @@ const endedChapters = ref(new Set<number>());
 let workbenchToken = 0;
 let focusBeforeWiki: HTMLElement | null = null;
 let stopDelta: (() => void) | null = null;
+let stopProgress: (() => void) | null = null;
+let preparationTimer: ReturnType<typeof setInterval> | null = null;
+let preparationToken = 0;
 let pendingIdx: number | null = null;
 let disposed = false;
 const streamingText = ref("");
 const paragraphs = computed(() => (loading.value ? streamingText.value : chapterText.value).split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
 const fontOptions = [16, 18, 20, 22].map((size) => ({ label: `${size} px`, value: size }));
 const themeOptions = [{ label: "纸白", value: "paper" }, { label: "米黄", value: "sepia" }, { label: "夜间", value: "night" }];
-const readingModeOptions = [{ label: "原文", value: "original" }, { label: "改写", value: "rewrite" }];
+const readingModeOptions = computed(() => [{ label: "原文", value: "original" }, { label: rewriteReady.value ? "改写" : "改写（前置资料未就绪）", value: "rewrite", disabled: !rewriteReady.value }]);
 const readerOverrides = computed(() => ({ common: { primaryColor: readerTheme.value === "night" ? "#818cf8" : "#6366f1", primaryColorHover: readerTheme.value === "night" ? "#a5b4fc" : "#818cf8", primaryColorPressed: "#4f46e5", bodyColor: readerTheme.value === "sepia" ? "#f5efdc" : readerTheme.value === "night" ? "#18181b" : "#ffffff", cardColor: readerTheme.value === "sepia" ? "#f5efdc" : readerTheme.value === "night" ? "#18181b" : "#ffffff", textColor2: readerTheme.value === "sepia" ? "#5b4a32" : readerTheme.value === "night" ? "#d4d4d8" : "#27272a" } }));
 
+async function refreshPreparation(): Promise<void> {
+  const bookId = props.bookId;
+  const token = ++preparationToken;
+  try {
+    const statuses = await getExtractionStatuses();
+    if (disposed || token !== preparationToken || bookId !== props.bookId) return;
+    const wasReady = rewriteReady.value;
+    preparation.value = statuses.find(status => status.book_id === bookId) ?? null;
+    preparationError.value = "";
+    if (!wasReady && rewriteReady.value && wikiOpen.value) void refreshWorkbench();
+  } catch (reason) { if (!disposed && token === preparationToken && bookId === props.bookId) preparationError.value = `准备状态暂时不可用：${String(reason)}`; }
+}
+async function retryQuickRead(): Promise<void> {
+  if (retryingPreparation.value) return;
+  const bookId = props.bookId;
+  retryingPreparation.value = true; preparationError.value = "";
+  try { await startQuickRead(bookId); if (bookId === props.bookId) await refreshPreparation(); }
+  catch (reason) { if (!disposed && bookId === props.bookId) preparationError.value = String(reason); }
+  finally { if (!disposed && bookId === props.bookId) retryingPreparation.value = false; }
+}
 async function loadChapter(idx: number): Promise<void> {
   if (idx < 1 || idx > titles.value.length || loading.value) return;
+  if (readingMode.value === "rewrite" && !rewriteReady.value) return;
   loading.value = true; error.value = ""; wikiWarning.value = null; pendingIdx = idx; streamingText.value = "";
   try {
     const ch = await getChapter(props.bookId, idx, readingMode.value);
@@ -60,16 +92,23 @@ async function loadChapter(idx: number): Promise<void> {
   finally { loading.value = false; pendingIdx = null; streamingText.value = ""; }
 }
 async function changeReadingMode(mode: ReadingMode): Promise<void> {
-  if (mode === readingMode.value) return;
+  if (mode === readingMode.value || loading.value || (mode === "rewrite" && !rewriteReady.value)) return;
   readingMode.value = mode; saveReadingMode(props.bookId, mode);
   await loadChapter(readingChapter(props.bookId, mode));
 }
 async function loadBook(): Promise<void> {
   closeWiki();
-  readingMode.value = savedReadingMode(props.bookId);
+  preparation.value = null; preparationError.value = ""; retryingPreparation.value = false;
+  readingMode.value = "original";
   wikiView.value = null; questionBatch.value = null; records.value = []; chapterRecords.clear(); endedChapters.value.clear(); submitting.value = false;
   error.value = ""; chapterText.value = ""; chapterTitle.value = ""; titles.value = []; currentIdx.value = 1;
-  try { titles.value = await getChapterTitles(props.bookId); if (titles.value.length) await loadChapter(Math.min(readingChapter(props.bookId, readingMode.value), titles.value.length)); }
+  try {
+    const readiness = refreshPreparation();
+    titles.value = await getChapterTitles(props.bookId);
+    if (titles.value.length) await loadChapter(Math.min(readingChapter(props.bookId, "original"), titles.value.length));
+    await readiness;
+    if (!disposed && savedReadingMode(props.bookId) === "rewrite" && rewriteReady.value) await changeReadingMode("rewrite");
+  }
   catch (e) { error.value = String(e); }
 }
 function closeWiki(): void {
@@ -95,7 +134,7 @@ async function refreshWorkbench(): Promise<void> {
   const chapterIdx = nextChapterIdx.value;
   const current = () => !disposed && token === workbenchToken && bookId === props.bookId && chapterIdx === nextChapterIdx.value;
   wikiLoading.value = true; wikiError.value = ""; wikiView.value = null;
-  questionLoading.value = hasNextChapter.value; questionError.value = ""; questionBatch.value = null;
+  questionLoading.value = hasNextChapter.value && rewriteReady.value; questionError.value = ""; questionBatch.value = null;
   const loadWiki = async () => {
     try { const view = await getWikiView(bookId); if (current()) wikiView.value = view; }
     catch (reason) { if (current()) wikiError.value = String(reason); }
@@ -111,6 +150,7 @@ async function refreshWorkbench(): Promise<void> {
       records.value = (chapterRecords.get(chapterIdx) ?? []).filter(record => activeBatchIds.has(record.question_batch_id));
       applyReturnedOverrides(history.flatMap(item => item.overridden_option_ids), chapterIdx);
       if (endedChapters.value.has(chapterIdx)) return;
+      if (!rewriteReady.value) return;
       const batchIndex = history.reduce((next, item) => item.batch_index === null ? next : Math.max(next, item.batch_index + 1), 0);
       const batch = await getQuestionBatch(bookId, chapterIdx, batchIndex);
       if (current()) questionBatch.value = batch;
@@ -169,20 +209,40 @@ async function submitQuestionnaire(submission: QuestionnaireSubmission, end: boo
 }
 watch(() => props.bookId, loadBook);
 onMounted(async () => {
-  try {
-    const stop = await onKgEvent("chapter:delta", parseChapterDelta, event => {
-      if (!disposed && event.book_id === props.bookId && event.chapter_idx === pendingIdx) streamingText.value += event.delta;
-    });
-    if (disposed) stop(); else { stopDelta = stop; await loadBook(); }
-  } catch (e) { if (!disposed) error.value = String(e); }
+  const subscribeDelta = async () => {
+    try {
+      const stop = await onKgEvent("chapter:delta", parseChapterDelta, event => {
+        if (!disposed && event.book_id === props.bookId && event.chapter_idx === pendingIdx) streamingText.value += event.delta;
+      });
+      if (disposed) stop(); else stopDelta = stop;
+    } catch { /* Original reading does not depend on the streaming listener. */ }
+  };
+  const subscribeProgress = async () => {
+    try {
+      const stop = await onKgEvent("job:progress", parseJobStatus, event => {
+        if (!disposed && event.book_id === props.bookId) void refreshPreparation();
+      });
+      if (disposed) stop(); else stopProgress = stop;
+    } catch { /* Polling also recovers missed job events. */ }
+  };
+  preparationTimer = setInterval(() => void refreshPreparation(), 3000);
+  await Promise.all([subscribeDelta(), subscribeProgress(), loadBook()]);
 });
-onUnmounted(() => { disposed = true; workbenchToken++; stopDelta?.(); });
+onUnmounted(() => { disposed = true; workbenchToken++; stopDelta?.(); stopProgress?.(); if (preparationTimer !== null) clearInterval(preparationTimer); });
 </script>
 
 <template>
   <NConfigProvider :theme="readerTheme === 'night' ? darkTheme : null" :theme-overrides="readerOverrides">
     <section v-if="wikiOpen" class="wiki-overlay" aria-label="Wiki 与下一章选择" @keydown.esc="closeWiki">
       <header class="wiki-bar"><NButton data-action="close-wiki" @click="closeWiki">返回阅读</NButton><span>第 {{ currentIdx }} 章 · Wiki / StoryMap</span></header>
+      <section class="preparation warning" aria-label="改写准备进度" role="status">
+        <span v-for="phase in preparationLabels" :key="phase">{{ phase }}</span>
+        <span v-if="preparationDetails">{{ preparationDetails }}</span>
+        <p v-if="!rewriteReady">原文仍可阅读，文字干预可以保存；改写需等待全书速读与原文 Wiki 初始化。</p>
+        <p v-if="preparation?.error" role="alert">{{ preparation.error }} · 已完成的准备结果保留，可恢复未完成阶段。</p>
+        <p v-if="preparationError" role="alert">{{ preparationError }}</p>
+        <NButton v-if="canStartQuickRead(preparation)" size="small" data-action="retry-quick-read" :loading="retryingPreparation" @click="retryQuickRead">{{ preparation?.kind === 'quick_read' || preparation?.kind === 'bootstrap_wiki' ? '恢复全书速读 / Wiki' : '开始全书速读' }}</NButton>
+      </section>
       <div class="wiki-content">
         <WikiWorkbench :view="wikiView" :loading="wikiLoading" :error="wikiError" :can-jump="!loading && !submitting" @jump="jumpToChapter" />
         <QuestionnairePanel v-if="hasNextChapter && !endedChapters.has(nextChapterIdx)" :key="`${bookId}-${nextChapterIdx}`" :batch="questionBatch" :records="records" :loading="questionLoading" :submitting="submitting" :error="questionError" @submit="submitQuestionnaire($event, false)" @end="submitQuestionnaire($event, true)" />
@@ -206,6 +266,14 @@ onUnmounted(() => { disposed = true; workbenchToken++; stopDelta?.(); });
         <NButton v-if="titles.length" size="small" data-action="open-wiki" :disabled="loading" @click="openWiki">Wiki / StoryMap</NButton>
         <div class="bar-ops"><NSelect v-model:value="fontSize" :options="fontOptions" aria-label="字号" class="font-select" size="small" /><NSelect v-model:value="readerTheme" :options="themeOptions" aria-label="阅读主题" class="theme-select" size="small" /></div>
       </header>
+      <section class="preparation warning" aria-label="改写准备进度" role="status">
+        <span v-for="phase in preparationLabels" :key="phase">{{ phase }}</span>
+        <span v-if="preparationDetails">{{ preparationDetails }}</span>
+        <p v-if="!rewriteReady">原文仍可阅读；改写需等待全书速读与原文 Wiki 初始化。</p>
+        <p v-if="preparation?.error" role="alert">{{ preparation.error }} · 已完成的准备结果保留，可恢复未完成阶段。</p>
+        <p v-if="preparationError" role="alert">{{ preparationError }}</p>
+        <NButton v-if="canStartQuickRead(preparation)" size="small" data-action="retry-quick-read" :loading="retryingPreparation" @click="retryQuickRead">{{ preparation?.kind === 'quick_read' || preparation?.kind === 'bootstrap_wiki' ? '恢复全书速读 / Wiki' : '开始全书速读' }}</NButton>
+      </section>
       <NAlert v-if="readingMode === 'rewrite' && rewriteStatus === 'unavailable'" type="info" class="warning">本章尚未改写；请先完成上一章的选择或文字干预。</NAlert>
       <NAlert v-if="wikiWarning" type="warning" class="warning">正文已保存；Wiki 同步稍后重试：{{ wikiWarning }}</NAlert>
       <NAlert v-if="error" type="error" class="error" role="alert">{{ error }}</NAlert>
@@ -253,6 +321,8 @@ onUnmounted(() => { disposed = true; workbenchToken++; stopDelta?.(); });
 .chapter-text p { margin: 0 0 0.8em; text-indent: 2em; white-space: pre-wrap; }
 .loading { padding: var(--space-xl) 0; text-align: center; }
 .warning { max-width: var(--reader-measure); margin: var(--space-md) auto; }
+.preparation { display: grid; gap: var(--space-xs); font-size: 13px; }
+.preparation p { margin: 0; }
 .pager { position: fixed; bottom: 0; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: var(--space-lg); padding: 12px 12px max(12px, env(safe-area-inset-bottom)); background: var(--reader-bg); color: var(--reader-text); border-top: 1px solid currentColor; }
 @media (max-width: 480px) {
   .reader { padding-inline: max(var(--space-md), env(safe-area-inset-left), env(safe-area-inset-right)); }

@@ -33,6 +33,8 @@ pub enum JobKind {
     ChapterExtract,
     Generate,
     Reconcile,
+    QuickRead,
+    BootstrapWiki,
 }
 
 impl JobKind {
@@ -42,6 +44,8 @@ impl JobKind {
             JobKind::ChapterExtract => "chapter_extract",
             JobKind::Generate => "generate",
             JobKind::Reconcile => "reconcile",
+            JobKind::QuickRead => "quick_read",
+            JobKind::BootstrapWiki => "bootstrap_wiki",
         }
     }
 }
@@ -64,8 +68,7 @@ pub fn enqueue(
     payload: serde_json::Value,
 ) -> rusqlite::Result<i64> {
     // Non-global work is idempotent per chapter; an older active chapter cannot
-    // swallow a newer reading request after recovery.
-    let chapter = if kind == JobKind::GlobalExtract { None } else { payload.get("chapter_idx").and_then(serde_json::Value::as_i64) };
+    let chapter = if matches!(kind, JobKind::GlobalExtract | JobKind::QuickRead) { None } else { payload.get("chapter_idx").and_then(serde_json::Value::as_i64) };
     let existing = conn.query_row(
         "SELECT id FROM jobs WHERE book_id=?1 AND kind=?2 AND state IN ('queued','running','paused')
          AND (?3 IS NULL OR json_extract(payload_json,'$.chapter_idx')=?3) ORDER BY id LIMIT 1",
@@ -93,7 +96,7 @@ fn blocking_failure(conn: &Connection, book_id: i64) -> rusqlite::Result<Option<
          FROM jobs failed
          WHERE failed.book_id=?1
            AND failed.state='failed'
-           AND failed.kind IN ('global_extract','chapter_extract','generate')
+           AND failed.kind IN ('global_extract','chapter_extract','generate','quick_read','bootstrap_wiki')
            AND NOT EXISTS(
              SELECT 1 FROM jobs recovery
              WHERE recovery.book_id=failed.book_id
@@ -119,7 +122,7 @@ pub fn ensure_prefetch_allowed(conn: &Connection, job_id: i64) -> Result<(), Str
         [job_id],
         |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
     ).optional().map_err(|e| e.to_string())? else { return Ok(()); };
-    if !matches!(kind.as_str(), "global_extract" | "chapter_extract" | "generate") {
+    if !matches!(kind.as_str(), "global_extract" | "chapter_extract" | "generate" | "quick_read" | "bootstrap_wiki") {
         return Ok(());
     }
     let origin = payload.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())

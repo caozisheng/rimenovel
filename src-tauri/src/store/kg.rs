@@ -103,17 +103,23 @@ fn check_line(conn:&Connection,book:i64,expected:i64)->Result<(),String>{if line
 pub fn missing_original_chapters(conn:&Connection,book_id:i64)->Result<Vec<i64>,String>{Ok(coverage(conn,book_id)?.missing_chapters)}
 pub fn job_checkpoint(conn:&Connection,job_id:i64)->Result<Value,String>{let payload=conn.query_row("SELECT payload_json FROM jobs WHERE id=?1",[job_id],|r|r.get::<_,Option<String>>(0)).map_err(err)?;payload.as_deref().map(parse).transpose().map(|p|p.unwrap_or_else(||serde_json::json!({})))}
 pub fn save_generated(conn:&Connection,book_id:i64,idx:i64,content:&str,model:&str,dependency_digest:&str,expected_line_version:i64)->Result<TextVersion,String>{
+    let tx=conn.unchecked_transaction().map_err(err)?;
+    let text=save_generated_in_transaction(&tx,book_id,idx,content,model,dependency_digest,expected_line_version)?;
+    tx.commit().map_err(err)?;Ok(text)
+}
+
+pub(crate) fn save_generated_in_transaction(conn:&Connection,book_id:i64,idx:i64,content:&str,model:&str,dependency_digest:&str,expected_line_version:i64)->Result<TextVersion,String>{
     ensure_chapter(conn,book_id,idx)?;let planned=crate::store::story::active_next_wiki(conn,book_id,idx)?.is_some();if idx==1 || (!planned && divergence(conn,book_id)?.is_none_or(|d|idx<d)){return Err("chapter does not belong to generated reading line".into());}
-    let tx=conn.unchecked_transaction().map_err(err)?;check_line(&tx,book_id,expected_line_version)?;
+    check_line(conn,book_id,expected_line_version)?;
     let hash=digest(content.as_bytes());
-    let existing=tx.query_row("SELECT t.generated_id FROM kg_text_versions t JOIN generated_chapters g ON g.id=t.generated_id WHERE t.book_id=?1 AND t.chapter_idx=?2 AND t.source='generated' AND t.content_hash=?3 AND g.prompt_digest=?4 AND g.model=?5 ORDER BY t.id DESC LIMIT 1",params![book_id,idx,hash,dependency_digest,model],|r|r.get::<_,i64>(0)).optional().map_err(err)?;
-    let id=if let Some(id)=existing {id} else {tx.execute("INSERT INTO generated_chapters(book_id,chapter_idx,content,model,prompt_digest,active,line_version) VALUES (?1,?2,?3,?4,?5,0,?6)",params![book_id,idx,content,model,dependency_digest,expected_line_version]).map_err(err)?;tx.last_insert_rowid()};
-    let text=text_version(&tx,book_id,idx,"generated",Some(id))?;select_generated(&tx,&text,expected_line_version)?;tx.commit().map_err(err)?;Ok(text)
+    let existing=conn.query_row("SELECT t.generated_id FROM kg_text_versions t JOIN generated_chapters g ON g.id=t.generated_id WHERE t.book_id=?1 AND t.chapter_idx=?2 AND t.source='generated' AND t.content_hash=?3 AND g.prompt_digest=?4 AND g.model=?5 ORDER BY t.id DESC LIMIT 1",params![book_id,idx,hash,dependency_digest,model],|r|r.get::<_,i64>(0)).optional().map_err(err)?;
+    let id=if let Some(id)=existing{id}else{conn.execute("INSERT INTO generated_chapters(book_id,chapter_idx,content,model,prompt_digest,active,line_version) VALUES (?1,?2,?3,?4,?5,0,?6)",params![book_id,idx,content,model,dependency_digest,expected_line_version]).map_err(err)?;conn.last_insert_rowid()};
+    let text=text_version(conn,book_id,idx,"generated",Some(id))?;select_generated(conn,&text,expected_line_version)?;Ok(text)
 }
 pub fn cached_generated(conn:&Connection,book_id:i64,idx:i64,dependency_digest:&str)->Result<Option<TextVersion>,String>{
     ensure_chapter(conn,book_id,idx)?;let id=conn.query_row("SELECT id FROM generated_chapters WHERE book_id=?1 AND chapter_idx=?2 AND prompt_digest=?3 ORDER BY id DESC LIMIT 1",params![book_id,idx,dependency_digest],|r|r.get::<_,i64>(0)).optional().map_err(err)?;id.map(|id|text_version(conn,book_id,idx,"generated",Some(id))).transpose()
 }
-fn invalidate_generated_from(conn:&Connection,book:i64,idx:i64)->Result<(),String>{
+pub(crate) fn invalidate_generated_from(conn:&Connection,book:i64,idx:i64)->Result<(),String>{
     conn.execute("UPDATE generated_chapters SET active=0 WHERE book_id=?1 AND chapter_idx>=?2",params![book,idx]).map_err(err)?;
     conn.execute("UPDATE kg_lite_snapshots SET active=0 WHERE text_version_id IN(SELECT id FROM kg_text_versions WHERE book_id=?1 AND chapter_idx>=?2 AND source='generated')",params![book,idx]).map_err(err)?;
     conn.execute("DELETE FROM kg_read_selection WHERE book_id=?1 AND chapter_idx>=?2",params![book,idx]).map_err(err)?;

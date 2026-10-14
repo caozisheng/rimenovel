@@ -23,6 +23,21 @@ mod tests {
     }
 
     #[test]
+    fn intervention_for_visited_chapter_is_rejected_without_changing_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        Db::new(&conn).migrate().unwrap();
+        let book = create_book_with_chapters(&conn,"Visited",None,"txt","story.txt",&[
+            NewChapter{idx:1,title:"一".into(),text:"原文一".into(),token_est:2},
+            NewChapter{idx:2,title:"二".into(),text:"原文二".into(),token_est:2},
+        ]).unwrap();
+        crate::store::kg::mark_read(&conn,book,2).unwrap();
+        let input = InterventionInput{book_id:book,chapter_idx:2,batch_index:None,question_batch_id:None,selected_option_ids:vec![],free_text:Some("倒改已读剧情".into()),overridden_option_ids:vec![],reading_line_version:0};
+        assert!(save_intervention(&conn,&input).is_err());
+        assert!(active_interventions(&conn,book,2).unwrap().is_empty());
+        assert_eq!(crate::store::kg::progress(&conn,book).unwrap(),2);
+    }
+
+    #[test]
     fn replacing_next_wiki_deactivates_previous_revision() {
         let (conn, book) = db();
         let previous = crate::store::kg::text_version(&conn, book, 1, "original", None).unwrap().id;

@@ -16,7 +16,7 @@ use tauri::{Emitter, Manager};
 static BOOK_GATES: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static RUNNING_JOBS: LazyLock<Mutex<HashMap<i64, ActiveJob>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 // Bounded cross-book work. The lock order is book gate, then global permit.
-static PROVIDER_LIMIT: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(2));
+pub(crate) static PROVIDER_LIMIT: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(2));
 const BOOK_CALL_LIMIT: usize = 45;
 
 pub(crate) fn epoch_ms() -> u64 {
@@ -136,8 +136,8 @@ fn require_active(conn: &Connection, running: &RunningJob) -> Result<(), String>
 
 #[tauri::command]
 pub fn cancel_book_jobs(app: tauri::AppHandle, state: tauri::State<AppState>, book_id: i64) -> Result<(), String> {
+    crate::commands::quick_read::cancel_book(book_id);
     let active = RUNNING_JOBS.lock();
-    for job in active.values().filter(|job| job.book_id == book_id) { job.control.cancel(); }
     let ids = {
         let guard = state.db.lock();
         let conn = guard.as_ref().ok_or("数据库未初始化")?;
@@ -596,6 +596,7 @@ async fn run_book_samples(app: &tauri::AppHandle, book_id: i64, running: &Runnin
 }
 
 pub fn resume_jobs(app: &tauri::AppHandle) -> Result<(), String> {
+    crate::commands::quick_read::resume_jobs(app)?;
     let queued = {
         let state = app.state::<AppState>();
         let guard = state.db.lock();
@@ -662,7 +663,7 @@ pub async fn ensure_selected(app: &tauri::AppHandle, state: &AppState, book_id: 
 }
 
 fn story_generation_requested(conn:&Connection,book_id:i64,idx:i64)->Result<bool,String> {
-    Ok(crate::store::kg::divergence(conn,book_id)?.is_some_and(|from|idx>=from) || crate::store::story::active_next_wiki(conn,book_id,idx)?.is_some())
+    Ok(crate::store::kg::divergence(conn,book_id)?.is_some_and(|from|idx>=from) || crate::commands::story::eligible_next_wiki(conn,book_id,idx)?.is_some())
 }
 
 fn enqueue_selected(active:&mut HashMap<i64,ActiveJob>,app:&tauri::AppHandle,conn:&Connection,book_id:i64,idx:i64,provider_id:Option<i64>)->Result<RunningJob,String> {
@@ -701,7 +702,7 @@ async fn run_selected(app: &tauri::AppHandle, state: &AppState, book_id: i64, id
         job_phase(app, running.id, "book_wait", None, None, Some(idx));
         let gate = book_gate(book_id);
         let _book = bounded(token, deadline, gate.lock()).await?;
-        let (cfg, config, generated, prepare_next_spec, shared_budget) = {
+        let (cfg, config, generated, shared_budget) = {
             let guard = state.db.lock();
             let conn = guard.as_ref().ok_or("数据库未初始化")?;
             require_active(conn, &running)?;
@@ -709,7 +710,6 @@ async fn run_selected(app: &tauri::AppHandle, state: &AppState, book_id: i64, id
             jobs::mark_running(conn, running.id).map_err(|e| e.to_string())?;
             let (cfg, config) = runtime_config(conn, provider_id)?;
             let generated = story_generation_requested(conn, book_id, idx)?;
-            let prepare_next_spec = repo::divergence(conn, book_id)? == Some(idx.saturating_add(1));
             let shared_budget = if !generated {
                 if let Some((owner, payload)) = active_book_budget(conn, book_id)? {
                     prepare_book_plan(conn, book_id, &config, &payload)?;
@@ -719,7 +719,7 @@ async fn run_selected(app: &tauri::AppHandle, state: &AppState, book_id: i64, id
                     Some((owner, payload, coverage.calls_used, elapsed))
                 } else { None }
             } else { None };
-            (cfg, config, generated, prepare_next_spec, shared_budget)
+            (cfg, config, generated, shared_budget)
         };
         let client = providers::make_client_with_control(cfg.clone(), running.control.clone())?;
         let mut budget = shared_budget.as_ref().map(|(owner, payload, calls, elapsed)| book_budget(app, book_id, *owner, payload, *calls, *elapsed, Some(idx))).transpose()?;
@@ -733,14 +733,7 @@ async fn run_selected(app: &tauri::AppHandle, state: &AppState, book_id: i64, id
         let _permit = bounded(token, deadline, PROVIDER_LIMIT.acquire()).await?.map_err(|e| e.to_string())?;
         job_phase(app, running.id, "chapter", None, None, Some(idx));
         let text = if generated {
-            let app_delta = app.clone();
-            let delta_token = token.clone();
-            let delta: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |text| {
-                if !delta_token.is_cancelled() {
-                    let _ = app_delta.emit("chapter:delta", json!({"book_id":book_id,"chapter_idx":idx,"delta":text}));
-                }
-            });
-            bounded(token, deadline, crate::core::kg_generate::ensure_chapter(state, client.as_ref(), &cfg, &config, book_id, idx, delta)).await??
+            bounded(token, deadline, crate::core::kg_generate::ensure_rewritten_chapter(state, client.as_ref(), &cfg, &config, book_id, idx, Some(running.id))).await??
         } else {
             let text = {
                 let _commit = client.commit_guard().map_err(|e| e.to_string())?;
@@ -765,11 +758,6 @@ async fn run_selected(app: &tauri::AppHandle, state: &AppState, book_id: i64, id
                 fail_foreground_target(conn, book_id, *owner, idx, error)?;
             }
             extracted?;
-            if prepare_next_spec {
-                // The requested original is now a cache hit. Generation prepares
-                // only the divergence-boundary spec from sparse reference data.
-                bounded(token, deadline, crate::core::kg_generate::ensure_chapter(state, client.as_ref(), &cfg, &config, book_id, idx, Arc::new(|_| {}))).await??;
-            }
             text
         };
         running.control.check().map_err(|e| e.to_string())?;
@@ -804,6 +792,9 @@ pub fn prefetch_next(app: tauri::AppHandle, book_id: i64) {
         let state = app.state::<AppState>();
         let guard = state.db.lock();
         let Some(conn) = guard.as_ref() else { return; };
+        let reference = match crate::store::quick_read::active_reference(conn, book_id) { Ok(Some(reference)) => reference, _ => return };
+        let bootstrap_ready: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE book_id=?1 AND kind='bootstrap_wiki' AND state='done' AND json_extract(payload_json,'$.source_digest')=?2)", params![book_id, reference.source_digest], |row| row.get(0)).unwrap_or(false);
+        if !bootstrap_ready { return; }
         let (progress, total) = match (repo::progress(conn, book_id), crate::store::books::count_chapters(conn, book_id)) {
             (Ok(progress), Ok(total)) if progress > 0 => (progress, total),
             _ => return,
@@ -860,13 +851,13 @@ mod cancellation_tests {
     }
 
     #[test]
-    fn ready_story_plan_selects_generation_without_full_book_extraction() {
+    fn unqualified_legacy_plan_does_not_select_generated_chapter() {
         let conn = job_database();
         let book = sampled_book(&conn, 2, "前章正文");
         let previous = repo::text_version(&conn, book, 1, "original", None).unwrap();
         let wiki = crate::core::story::NextChapterWiki { chapter_idx: 2, goals: vec!["继续调查".into()], state_directions: vec![], open_threads: vec![], avoid: vec![], ending_direction: "留下线索".into(), related_entry_ids: vec![] };
         crate::store::story::save_next_wiki(&conn, book, 2, previous.id, 0, "dependency", &wiki).unwrap();
-        assert!(story_generation_requested(&conn, book, 2).unwrap());
+        assert!(!story_generation_requested(&conn, book, 2).unwrap());
         assert!(!story_generation_requested(&conn, book, 1).unwrap());
     }
 
@@ -966,24 +957,6 @@ mod cancellation_tests {
         let coverage = repo::coverage(&conn, book).unwrap();
         assert_eq!(coverage.calls_used, 44);
         assert!(coverage.elapsed_ms >= 470_000);
-        assert!(!coverage.target_complete);
-    }
-
-    #[test]
-    fn expired_initial_queue_persists_elapsed_before_failure_and_cannot_gain_time_on_recovery() {
-        let conn = job_database();
-        let book = sampled_book(&conn, 1, "Original prose");
-        let payload = json!({"graph_format":"kg-lite/v1","budget_started_ms":1000,"budget_elapsed_base_ms":0});
-        let id = jobs::enqueue(&conn, book, jobs::JobKind::GlobalExtract, payload.clone()).unwrap();
-        let elapsed = checkpoint_book_clock(&conn, book, id, &payload, 481_001).unwrap();
-        assert_eq!(elapsed, 480_001);
-        assert!(book_remaining(elapsed).is_err());
-        jobs::mark_failed(&conn, id, "deadline exceeded").unwrap();
-        let coverage = repo::coverage(&conn, book).unwrap();
-        assert_eq!(coverage.elapsed_ms, 480_001);
-        let recovery = json!({"budget_started_ms":700_000,"budget_elapsed_base_ms":coverage.elapsed_ms});
-        assert!(book_remaining(book_elapsed(&recovery, coverage.elapsed_ms, 700_001)).is_err());
-        assert_eq!(coverage.calls_used, 0);
         assert!(!coverage.target_complete);
     }
 

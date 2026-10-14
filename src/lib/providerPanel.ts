@@ -14,6 +14,9 @@ const emptyForm = {
   api_key: "",
   context_limit: 32768,
   output_reserve: 4096,
+  // Persisted name is shared with the backend: this toggles all online search, not just Tavily.
+  tavily_enabled: false,
+  tavily_api_key: "",
 };
 
 export const providerPanel = reactive({
@@ -43,6 +46,8 @@ export function editProvider(row: ProviderRow): void {
     api_key: "",
     context_limit: row.context_limit ?? 32768,
     output_reserve: row.output_reserve ?? 4096,
+    tavily_enabled: row.tavily_enabled,
+    tavily_api_key: "",
   };
   providerPanel.error = "";
   providerPanel.testResult = "";
@@ -68,6 +73,8 @@ export async function saveProvider(): Promise<void> {
         model_extract: providerPanel.form.model_extract || null,
         model_write: providerPanel.form.model_write || null,
         model_merge: providerPanel.form.model_merge || null,
+        tavily_enabled: providerPanel.form.tavily_enabled,
+        tavily_api_key: providerPanel.form.tavily_api_key,
       },
     });
     resetForm();

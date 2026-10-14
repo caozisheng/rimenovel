@@ -73,7 +73,20 @@ export function parseEditRecord(value: unknown): EditRecord {
 }
 export function parseJobStatus(value: unknown): GraphJobStatus {
   const v = record(value, "job status");
-  return { book_id: parseNumber(v.book_id, "job.book_id"), job_id: nullableNumber(v.job_id, "job.job_id"), kind: nullableString(v.kind, "job.kind"), chapter_idx: nullableNumber(v.chapter_idx, "job.chapter_idx"), progress: parseNumber(v.progress, "job.progress"), state: stringValue(v.state, "job.state"), error: nullableString(v.error, "job.error"), phase: nullableString(v.phase, "job.phase"), attempt: nullableNumber(v.attempt, "job.attempt"), retry_after_ms: nullableNumber(v.retry_after_ms, "job.retry_after_ms") };
+  const quick_read_source = v.quick_read_source == null ? null : stringValue(v.quick_read_source, "job.quick_read_source");
+  if (quick_read_source !== null && quick_read_source !== "local_full_text" && quick_read_source !== "web_outline") throw new Error("invalid job.quick_read_source");
+  const reference_sources = v.reference_sources == null ? [] : (() => {
+    if (!Array.isArray(v.reference_sources)) throw new Error("invalid job.reference_sources");
+    return v.reference_sources.map(source => { const item = record(source, "reference source"); const url = stringValue(item.url, "reference.url"); const parsed = new URL(url); if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("invalid reference.url"); return { url, title: stringValue(item.title, "reference.title") }; });
+  })();
+  const web_rejection=nullableString(v.web_rejection,"job.web_rejection");
+  const local_failure_kind=nullableString(v.local_failure_kind,"job.local_failure_kind");
+  const rejectionReasons=["invalid_lookup","search_unavailable","rate_limited","edition_text_unavailable","edition_unverified","evidence_insufficient","ambiguous_sources","context_insufficient","compaction_unavailable","invalid_outline"];
+  const legacyRejectionCodes=["invalid_lookup","search_unavailable","edition_text_unavailable","edition_unverified","evidence_insufficient","context_insufficient","compaction_unavailable","invalid_outline"];
+  const prefixed=/^(ddg|tavily)_(.+)$/.exec(web_rejection ?? "");
+  if (web_rejection && !legacyRejectionCodes.includes(web_rejection) && !(prefixed && rejectionReasons.includes(prefixed[2]))) throw new Error("invalid job.web_rejection");
+  if (local_failure_kind && !["authentication","rate_limited","upstream_unavailable","provider_configuration","provider_timeout","network_failure","output_truncated","stream_interrupted","invalid_output","source_evidence_incomplete","context_insufficient"].includes(local_failure_kind)) throw new Error("invalid job.local_failure_kind");
+  return { quick_read_source, reference_sources, web_rejection, local_failure_kind, book_id: parseNumber(v.book_id, "job.book_id"), job_id: nullableNumber(v.job_id, "job.job_id"), kind: nullableString(v.kind, "job.kind"), chapter_idx: nullableNumber(v.chapter_idx, "job.chapter_idx"), progress: parseNumber(v.progress, "job.progress"), state: stringValue(v.state, "job.state"), error: nullableString(v.error, "job.error"), phase: nullableString(v.phase, "job.phase"), stage: nullableString(v.stage, "job.stage"), completed_slices: nullableNumber(v.completed_slices, "job.completed_slices"), total_slices: nullableNumber(v.total_slices, "job.total_slices"), completed_chapters: nullableNumber(v.completed_chapters, "job.completed_chapters"), total_chapters: nullableNumber(v.total_chapters, "job.total_chapters"), quick_read_ready: v.quick_read_ready == null ? null : boolValue(v.quick_read_ready, "job.quick_read_ready"), bootstrap_ready: v.bootstrap_ready == null ? null : boolValue(v.bootstrap_ready, "job.bootstrap_ready"), attempt: nullableNumber(v.attempt, "job.attempt"), retry_after_ms: nullableNumber(v.retry_after_ms, "job.retry_after_ms") };
 }
 async function call<T>(command: string, args: Record<string, unknown> | undefined, parser: (value: unknown) => T): Promise<T> { return parser(await invoke<unknown>(command, args)); }
 export function getGraph(query: GraphQuery): Promise<GraphView> { return call("get_graph", { query }, parseGraphView); }
@@ -82,6 +95,7 @@ export async function applyGraphEdit(input: EditInput): Promise<number> { return
 export function revertGraphEdit(bookId: number, editId: number): Promise<void> { return call("revert_graph_edit", { bookId, editId }, () => undefined); }
 export async function listGraphEdits(bookId: number): Promise<EditRecord[]> { const value = await call("list_graph_edits", { bookId }, (raw) => raw); if (!Array.isArray(value)) throw new Error("graph edits must be an array"); return value.map(parseEditRecord); }
 export async function startBookExtraction(bookId: number, providerId?: number): Promise<number> { return call("start_book_extraction", { bookId, ...(providerId === undefined ? {} : { providerId }) }, (value) => parseNumber(value, "job id")); }
+export async function startQuickRead(bookId: number, providerId?: number): Promise<number> { return call("start_quick_read", { bookId, ...(providerId === undefined ? {} : { providerId }) }, (value) => parseNumber(value, "job id")); }
 export function cancelBookJobs(bookId: number): Promise<void> { return call("cancel_book_jobs", { bookId }, () => undefined); }
 export function extractChapterGraph(bookId: number, chapterIdx: number, providerId?: number): Promise<void> { return call("extract_chapter_graph", { bookId, chapterIdx, ...(providerId === undefined ? {} : { providerId }) }, () => undefined); }
 export async function getChapter(bookId: number, idx: number, mode: ReadingMode = "original"): Promise<ChapterContent> { return parseChapterContent(await invoke<unknown>("get_chapter_cmd", { bookId, idx, mode })); }

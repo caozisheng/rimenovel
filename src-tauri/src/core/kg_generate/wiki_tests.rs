@@ -70,7 +70,7 @@ fn input<'a>(history: &'a str, previous: &'a TextVersion, next: Option<&'a NextC
 }
 
 #[test]
-fn wiki_writer_has_exactly_three_story_inputs_and_no_original_next_reference() {
+fn resolved_writer_context_keeps_actual_history_and_selected_prose_separate_from_future_wiki() {
     let (_conn, book) = database();
     let mut previous = selected_text();
     previous.book_id = book;
@@ -80,17 +80,13 @@ fn wiki_writer_has_exactly_three_story_inputs_and_no_original_next_reference() {
     let mut request = input(history, &previous, Some(&next), &[]);
     request.book_id = book;
     let context = build_wiki_generation_context(&request).unwrap();
-    let messages = build_wiki_write_messages(&context, &config()).unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].role, "system");
-    assert_eq!(messages[1].role, "user");
-    let payload: Value = serde_json::from_str(&messages[1].content).unwrap();
+    let payload = serde_json::to_value(&context).unwrap();
     assert_eq!(payload.as_object().unwrap().keys().map(String::as_str).collect::<BTreeSet<_>>(),
         BTreeSet::from(["historical_wiki", "previous_selected_full_text", "effective_next_wiki"]));
     assert_eq!(payload["historical_wiki"], serde_json::from_str::<Value>(history).unwrap());
     assert_eq!(payload["previous_selected_full_text"].as_str(), Some(full_prose.as_str()));
     assert_eq!(payload["effective_next_wiki"]["wiki"], serde_json::to_value(&next).unwrap());
-    let combined = messages.iter().map(|message| message.content.as_str()).collect::<Vec<_>>().join("\n");
+    let combined = payload.to_string();
     for excluded in ["原作第3章", "original_reference_text", "original_reference_graph", "hidden_reference", "working_spec", "actual_chapter", "hard_state", "intent_constraints", "known_entities"] {
         assert!(!combined.contains(excluded), "unexpected legacy writer input: {excluded}");
     }
@@ -106,13 +102,12 @@ fn wiki_writer_excludes_conflicting_answers_but_keeps_valid_answer_meaning() {
     let previous = selected_text();
     let next = next_wiki();
     let context = build_wiki_generation_context(&input("{}", &previous, Some(&next), &interventions)).unwrap();
-    let messages = build_wiki_write_messages(&context, &config()).unwrap();
-    let payload: Value = serde_json::from_str(&messages[1].content).unwrap();
+    let payload = serde_json::to_value(&context).unwrap();
     assert_eq!(payload["effective_next_wiki"]["valid_selected_answers"], json!([
         {"question_id":"q2","prompt":"方向问题2","option_id":"o2-0","label":"方向答案2-0"}
     ]));
     for excluded in ["o0-0", "o1-0", "方向答案0-0", "方向答案1-0", "conflicts_with", "invalid_reason"] {
-        assert!(!messages[1].content.contains(excluded));
+        assert!(!payload.to_string().contains(excluded));
     }
     assert_eq!(resolved.selected.len(), 3);
     assert!(!resolved.selected[0].valid);
@@ -127,13 +122,11 @@ fn wiki_writer_preserves_user_text_and_excludes_overridden_answers() {
     let previous = selected_text();
     let next = next_wiki();
     let context = build_wiki_generation_context(&input("{}", &previous, Some(&next), &interventions)).unwrap();
-    let messages = build_wiki_write_messages(&context, &config()).unwrap();
-    let payload: Value = serde_json::from_str(&messages[1].content).unwrap();
+    let payload = serde_json::to_value(&context).unwrap();
     assert_eq!(payload["effective_next_wiki"]["user_free_text"], json!([text]));
     assert_eq!(payload["effective_next_wiki"]["valid_selected_answers"].as_array().unwrap().len(), 1);
-    assert!(!messages[1].content.contains("o0-0"));
-    assert!(!messages[1].content.contains("方向答案0-0"));
-    assert!(messages[0].content.contains("用户自由文字 > 有效选项答案"));
+    assert!(!payload.to_string().contains("o0-0"));
+    assert!(!payload.to_string().contains("方向答案0-0"));
 }
 
 #[test]
@@ -154,11 +147,10 @@ fn wiki_writer_does_not_trust_invalid_or_overridden_effective_records() {
     let previous = selected_text();
     let next = next_wiki();
     let context = build_wiki_generation_context(&input("{}", &previous, Some(&next), &interventions)).unwrap();
-    let messages = build_wiki_write_messages(&context, &config()).unwrap();
-    let payload: Value = serde_json::from_str(&messages[1].content).unwrap();
+    let payload = serde_json::to_value(&context).unwrap();
     assert_eq!(payload["effective_next_wiki"]["valid_selected_answers"], json!([]));
-    assert!(!messages[1].content.contains("o0-0"));
-    assert!(!messages[1].content.contains("o1-0"));
+    assert!(!payload.to_string().contains("o0-0"));
+    assert!(!payload.to_string().contains("o1-0"));
 }
 
 #[test]
@@ -189,13 +181,61 @@ fn wiki_writer_rejects_bad_history_or_wrong_selected_predecessor() {
 fn wiki_writer_allows_zero_answers_but_rejects_budget_instead_of_truncating_prose() {
     let previous = selected_text();
     let next = next_wiki();
-    let context = build_wiki_generation_context(&input("{}", &previous, Some(&next), &[])).unwrap();
-    let mut tiny = config();
-    tiny.context_limit = 100;
-    assert!(build_wiki_write_messages(&context, &tiny).err().unwrap().contains("上下文预算"));
-    let messages = build_wiki_write_messages(&context, &config()).unwrap();
-    let payload: Value = serde_json::from_str(&messages[1].content).unwrap();
-    assert_eq!(payload["previous_selected_full_text"], previous.content);
-    assert_eq!(payload["effective_next_wiki"]["valid_selected_answers"], json!([]));
-    assert_eq!(payload["effective_next_wiki"]["user_free_text"], json!([]));
+    let quick=quick_read_reference();
+    let original=TextVersion { id:99, book_id:1, chapter_idx:3, source:"original".into(), content:"原作第三章完整正文".into(), content_hash:"original-3".into(), generated_id:None };
+    let request=RewriteInputs { book_id:1, chapter_idx:3, quick_read:&quick, historical_wiki:"{}", previous_selected_text:&previous, original_target:&original, original_target_wiki:None, next_wiki:&next, interventions:&[] };
+    let mut tiny=config(); tiny.context_limit=100;
+    assert!(build_rewrite_messages(&request,&tiny).is_err());
+    let messages=build_rewrite_messages(&request,&config()).unwrap();
+    let payload:Value=serde_json::from_str(&messages[1].content).unwrap();
+    assert_eq!(payload["previous_selected_full_text"],previous.content);
+    assert_eq!(payload["next_chapter_wiki"]["valid_selected_answers"],json!([]));
+    assert_eq!(payload["next_chapter_wiki"]["user_free_text"],json!([]));
+}
+
+fn quick_read_reference()->crate::core::quick_read::QuickReadReference {
+    crate::core::quick_read::QuickReadReference {
+        schema_version:"v1".into(),source_digest:"book-digest".into(),provider_id:1,model:"reader".into(),prompt_version:"quick/v1".into(),
+        source_kind:crate::core::quick_read::QuickReadSourceKind::LocalFullText,source_provenance:vec![],
+        chapter_summaries:vec![crate::core::quick_read::ChapterQuickRead{chapter_idx:1,summary:"主角救下侍童".into(),character_refs:vec!["hero".into()]},crate::core::quick_read::ChapterQuickRead{chapter_idx:20,summary:"侍童身份揭示".into(),character_refs:vec!["hero".into()]}],
+        characters:vec![crate::core::quick_read::QuickReadCharacterCard{id:"hero".into(),name:"顾岚".into(),aliases:vec!["阿七".into()],identity_evidence:vec!["第二十章确认两名相同".into()],motivations:vec!["保护边城".into()],narrative_roles:vec!["主线人物".into()],first_appearance_chapter:1,revelations:vec![crate::core::quick_read::CharacterReveal{chapter_idx:20,evidence:"真实身份揭示".into()}],source_chapters:vec![1,20]}],
+        plot_summary:"守城主线".into(),plot_notes:vec![],completed_spans:vec![],
+    }
+}
+
+#[test]
+fn rewrite_writer_receives_all_required_sources_and_keeps_future_reference_separate(){
+    let previous=selected_text();let next=next_wiki();let quick=quick_read_reference();
+    let original=TextVersion{id:99,book_id:1,chapter_idx:3,source:"original".into(),content:"原作第三章完整正文：顾岚将受伤，但阿七会出现。".into(),content_hash:"original-3".into(),generated_id:None};
+    let actual_history=r#"{"entries":[{"id":"hero","name":"顾岚","summary":"第一章救下侍童"}]}"#;
+    let original_wiki=json!({"chapter":{"headline":"原作第三章","narrative":"身份线索","ending":{"open_threads":[]}},"entry_ids":["future-secret"]});
+    let message=build_rewrite_messages(&RewriteInputs{book_id:1,chapter_idx:3,quick_read:&quick,historical_wiki:actual_history,previous_selected_text:&previous,original_target:&original,original_target_wiki:Some(&original_wiki),next_wiki:&next,interventions:&[]},&config()).unwrap();
+    let payload:Value=serde_json::from_str(&message[1].content).unwrap();
+    assert_eq!(payload["quick_read"]["characters"][0]["name"],"顾岚");
+    assert_eq!(payload["previous_selected_full_text"],previous.content);
+    assert_eq!(payload["original_target_chapter"],original.content);
+    assert_eq!(payload["original_target_wiki"],original_wiki);
+    assert_eq!(payload["actual_history"],serde_json::from_str::<Value>(actual_history).unwrap());
+    assert_eq!(payload["next_chapter_wiki"]["wiki"]["goals"][0],"把信件交给守门人");
+    assert!(message[0].content.contains("未干预人物默认沿用原作核心身份和动机"));
+    assert!(message[0].content.contains("原作未来不是已发生事实"));
+}
+
+#[test]
+fn paired_rewrite_output_rejects_empty_prose_and_empty_actual_wiki(){
+    let schema=super::rewrite_output_schema();let validator=jsonschema::validator_for(schema).unwrap();
+    let valid=json!({"prose":"改写后的完整第三章正文","actual_chapter_wiki":{"chapter_idx":3,"chapter":{"headline":"城门受袭","narrative":"守军发现奸细，顾岚决定留下断后。","ending":{"open_threads":["奸细身份未明"]}},"entries":[{"id":"hero","kind":"character","name":"顾岚","aliases":["阿七"],"summary":"保护边城的主线人物","state_items":["第三章选择留下断后"],"related_entries":[],"open_threads":[],"source_chapters":[1,3]}]}});
+    assert!(validator.is_valid(&valid));
+    let mut missing_wiki=valid.clone();missing_wiki.as_object_mut().unwrap().remove("actual_chapter_wiki");assert!(super::decode_rewrite_result(missing_wiki,3).is_err());
+    let mut empty_prose=valid.clone();empty_prose["prose"]=json!(" ");assert!(super::decode_rewrite_result(empty_prose,3).is_err());
+    let mut wrong_chapter=valid;wrong_chapter["actual_chapter_wiki"]["chapter_idx"]=json!(2);assert!(super::decode_rewrite_result(wrong_chapter,3).is_err());
+}
+
+#[test]
+fn paired_rewrite_payload_has_no_future_actual_claim_until_bound_to_output(){
+    let value=json!({"prose":"顾岚改变了出场行动，但仍是保护边城的核心人物。","actual_chapter_wiki":{"chapter_idx":3,"chapter":{"headline":"顾岚改变出场行动","narrative":"顾岚没有在桥上救人，而是在城门内安排撤离。","ending":{"open_threads":[]}},"entries":[{"id":"hero","kind":"character","name":"顾岚","aliases":[],"summary":"保护边城","state_items":["主动安排撤离"],"related_entries":[],"open_threads":[],"source_chapters":[3]}]}});
+    let decoded=decode_rewrite_result(value,3).unwrap();
+    assert!(decoded.prose.contains("改变了出场行动"));
+    assert_eq!(decoded.actual_chapter_wiki["chapter"]["narrative"],"顾岚没有在桥上救人，而是在城门内安排撤离。");
+    assert!(decode_rewrite_result(json!({"prose":"正文","actual_chapter_wiki":{"chapter_idx":4,"chapter":{"headline":"标题","narrative":"叙事","ending":{"open_threads":[]}},"entries":[]}}),3).is_err());
 }
