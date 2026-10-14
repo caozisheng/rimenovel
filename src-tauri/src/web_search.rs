@@ -652,8 +652,12 @@ async fn prepare_candidate_set<E: SearchEngine>(
     select_candidate_set(lookup, candidates)
 }
 
+/// Match bibliographic candidates by the host's last two labels (not a public
+/// suffix lookup). IP addresses and single-label hosts keep their full identity.
+/// A group supplies every chapter, while its first proof-bearing page alone
+/// anchors the unchanged AI edition comparison; retain all pages for provenance.
 fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -> Result<CandidateSet, WebOutlineRejection> {
-    let mut complete = Vec::new();
+    let mut groups: BTreeMap<String, Vec<RawCandidate>> = BTreeMap::new();
     let mut has_text = false;
     let mut insufficient = false;
     for mut candidate in candidates {
@@ -661,25 +665,45 @@ fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -
         candidate.text = clip(&original, MAX_PROMPT_CHARS_PER_CANDIDATE);
         has_text |= !candidate.text.trim().is_empty();
         if !bibliographic_identity_matches(lookup, &candidate) { continue; }
-        let Some(paragraph) = source_first_paragraph(lookup, &candidate) else {
-            insufficient |= original.chars().count() > MAX_PROMPT_CHARS_PER_CANDIDATE
-                && source_first_paragraph(lookup, &RawCandidate { text: original, ..candidate.clone() }).is_some();
-            continue;
-        };
-        if lookup.chapters.iter().all(|chapter| chapter_section(chapter, &lookup.chapters, &candidate.text)
-            .is_some_and(|section| section.trim().chars().count() >= FIRST_CHAPTER_MIN_CHARS)) {
-            complete.push((candidate, paragraph));
-        } else {
-            insufficient = true;
+        if original.len() > candidate.text.len()
+            && source_first_paragraph(lookup, &candidate).is_none() {
+            insufficient |= source_first_paragraph(lookup, &RawCandidate { text: original, ..candidate.clone() }).is_some();
         }
+        let Ok(url) = Url::parse(&candidate.url) else { continue; };
+        let Some(host) = url.host_str() else { continue; };
+        let host = host.strip_suffix('.').unwrap_or(host);
+        let domain = if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+            host
+        } else {
+            let mut labels = host.rsplitn(3, '.');
+            let last = labels.next().unwrap_or(host);
+            match labels.next() {
+                Some(previous) => &host[host.len() - previous.len() - last.len() - 1..],
+                None => host,
+            }
+        };
+        groups.entry(domain.to_owned()).or_default().push(candidate);
     }
     if !has_text { return Err(WebOutlineRejection::EditionTextUnavailable); }
-    if complete.len() > 1 { return Err(WebOutlineRejection::AmbiguousSources); }
-    let (primary, proof_paragraph) = complete.pop().ok_or(if insufficient {
-        WebOutlineRejection::EvidenceInsufficient
-    } else { WebOutlineRejection::EditionUnverified })?;
-    Ok(CandidateSet { candidates: vec![primary.clone()], primary, proof_paragraph,
-        proof_chapter_index: proof_chapter(lookup).ok_or(WebOutlineRejection::InvalidLookup)?.index })
+    let mut complete = None;
+    for group in groups.into_values() {
+        let Some((primary_index, proof_paragraph)) = group.iter().enumerate().find_map(|(index, candidate)| {
+            source_first_paragraph(lookup, candidate).map(|paragraph| (index, paragraph))
+        }) else { continue; };
+        if !lookup.chapters.iter().all(|chapter| group.iter().any(|candidate| {
+            chapter_section(chapter, &lookup.chapters, &candidate.text)
+                .is_some_and(|section| section.trim().chars().count() >= FIRST_CHAPTER_MIN_CHARS)
+        })) {
+            insufficient = true;
+            continue;
+        }
+        if complete.is_some() { return Err(WebOutlineRejection::AmbiguousSources); }
+        complete = Some(CandidateSet {
+            primary: group[primary_index].clone(), candidates: group, proof_paragraph,
+            proof_chapter_index: proof_chapter(lookup).ok_or(WebOutlineRejection::InvalidLookup)?.index,
+        });
+    }
+    complete.ok_or(if insufficient { WebOutlineRejection::EvidenceInsufficient } else { WebOutlineRejection::EditionUnverified })
 }
 
 fn first_paragraph(text: &str, max_chars: usize) -> Option<String> {
@@ -1465,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn ddg_ambiguous_candidates_are_terminal_without_broad_retry() {
         let server = MockServer::start().await;
-        let body = format!("<a class='result__a' href='https://public.example/a'>钟楼书</a><a class='result__snippet'>{}</a><a class='result__a' href='https://public.example/b'>钟楼书</a><a class='result__snippet'>{}</a>", good_raw(), good_raw());
+        let body = format!("<a class='result__a' href='https://public.example/a'>钟楼书</a><a class='result__snippet'>{}</a><a class='result__a' href='https://other.example/b'>钟楼书</a><a class='result__snippet'>{}</a>", good_raw(), good_raw());
         Mock::given(method("POST")).and(path("/html/")).respond_with(ResponseTemplate::new(200).set_body_string(body)).expect(1).mount(&server).await;
         let ddg = DuckDuckGoClient::with_endpoint(format!("{}/html/", server.uri())).unwrap();
         let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
@@ -1525,11 +1549,115 @@ mod tests {
         assert!(validate_edition_verdict(&selected, json!({"verdict":"same"})).is_none());
     }
 
+    fn multi_page_fixture(domain: &str) -> (OutlineLookup, Vec<RawCandidate>) {
+        let chapters: Vec<_> = (1..=6).map(|index| LocalOutlineChapter {
+            index, heading: format!("第{index}章"), text: "林昭沿着河岸寻找失踪姐姐留下的线索并记录钟楼的钟声。".into(),
+        }).collect();
+        let candidates = [(1, 3), (4, 6)].into_iter().map(|(start, end)| RawCandidate {
+            title: "钟楼书".into(), url: format!("https://{domain}/chapters-{start}-{end}"),
+            text: (start..=end).map(|index| format!("第{index}章\n林昭沿着河岸寻找失踪姐姐留下的线索并记录钟楼的钟声。\n")).collect(),
+        }).collect();
+        (OutlineLookup { book_title: "钟楼书".into(), author: None, chapters }, candidates)
+    }
+
+    #[test]
+    fn multi_page_same_domain_combines_chapter_coverage() {
+        let (lookup, mut candidates) = multi_page_fixture("read.public.example");
+        candidates[1].url = "https://archive.public.example/chapters-4-6".into();
+        candidates.reverse();
+        let selected = select_candidate_set(&lookup, candidates.clone()).unwrap();
+        assert_eq!(selected.candidates.len(), 2);
+        assert_eq!(selected.candidates[0].url, candidates[0].url);
+        assert_eq!(selected.primary.url, candidates[1].url);
+        assert_eq!(selected.proof_chapter_index, 1);
+        assert_eq!(selected.proof_paragraph, source_first_paragraph(&lookup, &candidates[1]).unwrap());
+        assert!(validate_edition_verdict(&selected, json!({"verdict":"same", "source_url":candidates[0].url})).is_none());
+    }
+
+    #[test]
+    fn cross_domain_pages_do_not_combine() {
+        let (lookup, mut candidates) = multi_page_fixture("public.example");
+        candidates[1].url = "https://other.example/chapters-4-6".into();
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn two_complete_groups_remain_ambiguous() {
+        let (lookup, mut candidates) = multi_page_fixture("public.example");
+        candidates.extend(multi_page_fixture("other.example").1);
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::AmbiguousSources)));
+    }
+
+    #[test]
+    fn rooted_dns_hosts_do_not_merge_unrelated_domains() {
+        let (lookup, mut candidates) = multi_page_fixture("read.public.example.");
+        candidates[1].url = "https://archive.other.example./chapters-4-6".into();
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn rooted_dns_hosts_combine_with_their_unrooted_domain() {
+        let (lookup, mut candidates) = multi_page_fixture("read.public.example.");
+        candidates[1].url = "https://archive.public.example/chapters-4-6".into();
+        assert_eq!(select_candidate_set(&lookup, candidates).unwrap().candidates.len(), 2);
+    }
+
+    #[test]
+    fn ip_addresses_are_not_grouped_by_last_two_octets() {
+        let (lookup, mut candidates) = multi_page_fixture("93.184.216.34");
+        candidates[1].url = "https://94.184.216.34/chapters-4-6".into();
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn single_label_hosts_combine_only_with_the_same_host() {
+        let (lookup, candidates) = multi_page_fixture("novels");
+        assert_eq!(select_candidate_set(&lookup, candidates.clone()).unwrap().candidates.len(), 2);
+        let mut separate = candidates;
+        separate[1].url = "https://archive/chapters-4-6".into();
+        assert!(matches!(select_candidate_set(&lookup, separate), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn same_domain_complete_pages_form_one_group() {
+        let lookup = lookup_fixture();
+        let first = RawCandidate { title: "钟楼书".into(), url: "https://public.example/a".into(), text: good_raw().into() };
+        let second = RawCandidate { url: "https://public.example/b".into(), ..first.clone() };
+        let selected = select_candidate_set(&lookup, vec![first.clone(), second]).unwrap();
+        assert_eq!(selected.candidates.len(), 2);
+        assert_eq!(selected.primary.url, first.url);
+    }
+
+    #[test]
+    fn evidence_must_exist_on_its_cited_page() {
+        let (lookup, candidates) = multi_page_fixture("public.example");
+        let evidence = "林昭沿着河岸寻找失踪姐姐留下的线索并记录钟楼的钟声。";
+        assert!(provenance_for_chapter(&lookup, &candidates, &lookup.chapters[3], candidates[1].url.clone(), evidence.into()).is_some());
+        assert!(provenance_for_chapter(&lookup, &candidates, &lookup.chapters[3], candidates[0].url.clone(), evidence.into()).is_none());
+    }
+
+    #[tokio::test]
+    async fn multi_page_outline_prompt_preserves_entire_group_and_budget() {
+        let (lookup, candidates) = multi_page_fixture("public.example");
+        let selected = select_candidate_set(&lookup, candidates).unwrap();
+        let mut llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
+        call_outline_llm(&llm, &lookup, &selected.candidates, WebOutlineBudget::new(100_000, 4_096)).await.unwrap();
+        let prompt: Value = serde_json::from_str(llm.prompt.get_mut()).unwrap();
+        assert_eq!(prompt["sources"].as_array().unwrap().len(), 2);
+        for (source, candidate) in prompt["sources"].as_array().unwrap().iter().zip(&selected.candidates) {
+            assert_eq!(source["url"], candidate.url);
+            assert_eq!(source["text"], candidate.text);
+        }
+        assert!(matches!(call_outline_llm(&llm, &lookup, &selected.candidates, WebOutlineBudget::new(1, 1)).await,
+            Err(WebOutlineError::Rejected(WebOutlineRejection::ContextInsufficient))));
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn ambiguous_complete_candidates_are_not_submitted_for_comparison() {
         let lookup = lookup_fixture();
         let first = RawCandidate { title:"钟楼书".into(), url:"https://public.example/a".into(), text:good_raw().into() };
-        let second = RawCandidate { url:"https://public.example/b".into(), ..first.clone() };
+        let second = RawCandidate { url:"https://other.example/b".into(), ..first.clone() };
         assert!(matches!(select_candidate_set(&lookup, vec![first, second]), Err(WebOutlineRejection::AmbiguousSources)));
     }
 
@@ -1539,7 +1667,7 @@ mod tests {
         Mock::given(method("POST")).and(path("/search")).and(wiremock::matchers::body_string_contains("include_domains"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[
                 {"title":"钟楼书","url":"https://public.example/a","content":"","raw_content":good_raw()},
-                {"title":"钟楼书","url":"https://public.example/b","content":"","raw_content":good_raw()}
+                {"title":"钟楼书","url":"https://other.example/b","content":"","raw_content":good_raw()}
             ]}))).expect(1).mount(&server).await;
         let tavily = TavilyClient::with_endpoint("tvly-private".into(), format!("{}/search", server.uri())).unwrap();
         let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
@@ -1715,11 +1843,11 @@ mod tests {
     }
 
     #[test]
-    fn unproven_supplementary_page_cannot_complete_an_incomplete_source() {
+    fn cross_domain_supplementary_page_cannot_complete_an_incomplete_source() {
         let lookup = lookup_fixture();
         let primary = RawCandidate { title: "钟楼书".into(), url: "https://public.example/chapter-1".into(),
             text: good_raw().split("\n第二章").next().unwrap().into() };
-        let supplemental = RawCandidate { title: "钟楼书".into(), url: "https://public.example/chapter-2".into(),
+        let supplemental = RawCandidate { title: "钟楼书".into(), url: "https://other.example/chapter-2".into(),
             text: format!("钟楼书\n第二章 钟楼，林昭在钟楼发现钥匙。{}", "没有证明版本相同的来源内容".repeat(10)) };
         assert!(source_first_paragraph(&lookup, &primary).is_some());
         assert!(source_first_paragraph(&lookup, &supplemental).is_none());
@@ -1731,7 +1859,7 @@ mod tests {
         let lookup = lookup_fixture();
         let primary = RawCandidate { title: "钟楼书".into(), url: "https://public.example/chapter-1".into(), text: good_raw().into() };
         let mut supplemental = primary.clone();
-        supplemental.url = "https://public.example/other-coverage".into();
+        supplemental.url = "https://other.example/other-coverage".into();
         supplemental.text.extend((0..2_000).map(|offset| char::from_u32(0x5000 + offset).unwrap()));
         assert!(source_first_paragraph(&lookup, &primary).is_some());
         assert!(source_first_paragraph(&lookup, &supplemental).is_some());
