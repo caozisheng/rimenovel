@@ -67,7 +67,7 @@ fn web_lookup_fixture()->crate::web_search::OutlineLookup{
 }
 fn web_candidate_text()->&'static str{"钟楼书\n第一章 雨夜\n林昭走进旧宅发现一封信。这里进一步叙述城南钟楼的线索，正文长度足以支持来源章节匹配。"}
 fn ddg_candidate_results(count:usize)->String{
- (0..count).map(|index|format!("<a class='result__a' href='https://public.example/{index}'>钟楼书</a><a class='result__snippet'>{}</a>",web_candidate_text())).collect()
+ (0..count).map(|index|format!("<a class='result__a' href='https://candidate-{index}.example/{index}'>钟楼书</a><a class='result__snippet'>{}</a>",web_candidate_text())).collect()
 }
 #[tokio::test]
 async fn ddg_ambiguous_sources_skip_tavily_and_fall_back_locally(){
