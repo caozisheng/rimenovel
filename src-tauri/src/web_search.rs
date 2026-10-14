@@ -1437,10 +1437,15 @@ mod tests {
         let server = MockServer::start().await;
         let client = TavilyClient::with_endpoint("tvly-test".into(), format!("{}/search", server.uri())).unwrap();
         let url = "https://public.example/book";
-        let candidates = client.enrich_engine(SearchResponse { results: vec![SearchResult {
-            title: "钟楼书".into(), url: url.into(), content: String::new(),
-            raw_content: Some(page_with_chapter_at_fifteen_thousand_characters()), score: None,
-        }] }).await.unwrap();
+        Mock::given(method("POST")).and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[{
+                "title":"钟楼书", "url":url, "content":"摘要", "raw_content":page_with_chapter_at_fifteen_thousand_characters()
+            }]}))).expect(1).mount(&server).await;
+        let candidates = client.search("钟楼书", None).await.unwrap();
+        let candidates = enrich_candidates(&client, candidates).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/search");
         let lookup = lookup_fixture();
         let selected = select_candidate_set(&lookup, candidates).unwrap();
         assert!(find_heading_offset(&lookup.chapters[1].heading, &selected.candidates[0].text).is_some());
