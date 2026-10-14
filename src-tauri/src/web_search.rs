@@ -12,7 +12,7 @@ pub const TARGET_DOMAINS: &[&str] = &[
 
 const MAX_RESULTS: usize = 5;
 const MAX_CANDIDATES: usize = 4;
-const MAX_CANDIDATE_CHARS: usize = 12_000;
+// Fetch, enrichment, and selection share one visible per-page character window.
 const MAX_PROMPT_CHARS_PER_CANDIDATE: usize = 20_000;
 const MAX_EVIDENCE_CHARS: usize = 280;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1_500_000;
@@ -277,7 +277,7 @@ impl DuckDuckGoClient {
             bytes.extend_from_slice(&chunk);
         }
         let html = std::str::from_utf8(&bytes).map_err(|_| DdgError::Unavailable)?;
-        Ok(clip(html_to_text(html), MAX_CANDIDATE_CHARS))
+        Ok(clip(html_to_text(html), MAX_PROMPT_CHARS_PER_CANDIDATE))
     }
 }
 impl DuckDuckGoClient {
@@ -403,7 +403,7 @@ fn parse_ddg_html(html: &str) -> Result<Vec<SearchResult>, DdgError> {
     let finish = |capture: Capture<'_>, end: usize, results: &mut Vec<SearchResult>| {
         let text = &html[capture.start..end];
         if capture.is_title { results[capture.index].title = ddg_plain_text(text, 300); }
-        else { results[capture.index].content = ddg_plain_text(text, MAX_CANDIDATE_CHARS); }
+        else { results[capture.index].content = ddg_plain_text(text, MAX_PROMPT_CHARS_PER_CANDIDATE); }
     };
     for tag in TAGS.captures_iter(html) {
         let bounds = tag.get(0).unwrap();
@@ -575,7 +575,7 @@ impl SearchEngine for DuckDuckGoClient {
             let snippet = candidate.text.clone();
             if let Ok(text) = self.fetch_page_text(&candidate.url).await { candidate.text = text; }
             else { candidate.text = snippet; }
-            candidate.text = clip(&candidate.text, MAX_CANDIDATE_CHARS);
+            candidate.text = clip(&candidate.text, MAX_PROMPT_CHARS_PER_CANDIDATE);
         }
         Ok(candidates)
     }
@@ -788,7 +788,7 @@ async fn enrich_candidates(tavily: &TavilyClient, response: SearchResponse) -> R
             if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.url == result.url) { candidate.text = result.raw_content; }
         }
     }
-    for candidate in &mut candidates { candidate.text = clip(&candidate.text, MAX_CANDIDATE_CHARS); }
+    for candidate in &mut candidates { candidate.text = clip(&candidate.text, MAX_PROMPT_CHARS_PER_CANDIDATE); }
     Ok(candidates)
 }
 
@@ -1173,9 +1173,9 @@ mod tests {
     async fn ddg_fetch_clips_text_by_characters() {
         let server = MockServer::start().await;
         Mock::given(method("GET")).and(path("/book"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!("<p>{}</p>", "章".repeat(MAX_CANDIDATE_CHARS + 1))))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("<p>{}</p>", "章".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE + 1))))
             .expect(1).mount(&server).await;
-        assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await.unwrap(), "章".repeat(MAX_CANDIDATE_CHARS));
+        assert_eq!(ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await.unwrap(), "章".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE));
     }
 
     #[tokio::test]
@@ -1228,7 +1228,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_raw("x".repeat(size), "text/html"))
                 .expect(1).mount(&server).await;
             let result = ddg_page_client(&server).fetch_page_text(&ddg_page_url(&server)).await;
-            if size == MAX_HTTP_RESPONSE_BYTES { assert_eq!(result.unwrap(), "x".repeat(MAX_CANDIDATE_CHARS)); }
+            if size == MAX_HTTP_RESPONSE_BYTES { assert_eq!(result.unwrap(), "x".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE)); }
             else { assert_eq!(result, Err(DdgError::Unavailable)); }
         }
     }
@@ -1368,13 +1368,13 @@ mod tests {
     fn ddg_parse_bounds_titles_snippets_and_result_count() {
         let html = (0..MAX_RESULTS + 2).map(|index| format!(
             "<a class='other result__a' href='https://public.example/{index}'>{}</a><a href='https://public.example/{index}' class='result__snippet'>{}</a>",
-            "书".repeat(301), "章".repeat(MAX_CANDIDATE_CHARS + 1)
+            "书".repeat(301), "章".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE + 1)
         )).collect::<String>();
         let results = parse_ddg_html(&html).unwrap();
         assert_eq!(results.len(), MAX_RESULTS);
         for result in results {
             assert_eq!(result.title.chars().count(), 300);
-            assert_eq!(result.content.chars().count(), MAX_CANDIDATE_CHARS);
+            assert_eq!(result.content.chars().count(), MAX_PROMPT_CHARS_PER_CANDIDATE);
         }
     }
 
@@ -1408,6 +1408,43 @@ mod tests {
         let client = ddg_page_client(&server);
         let candidates = client.enrich_engine(SearchResponse { results: vec![SearchResult { title:"钟楼书".into(), url:ddg_page_url(&server), content:"摘要不含章节完整正文".into(), raw_content:None, score:None }] }).await.unwrap();
         assert_eq!(candidates[0].text, "第一章 雨夜\n完整正文来自候选页。");
+    }
+
+    fn page_with_chapter_at_fifteen_thousand_characters() -> String {
+        let mut text = good_raw().split("\n第二章").next().unwrap().to_owned();
+        text.push_str(&"填".repeat(15_000 - text.chars().count()));
+        text.push_str("\n第二章 钟楼，林昭在钟楼发现钥匙。");
+        text
+    }
+
+    #[tokio::test]
+    async fn ddg_enrichment_retains_chapter_at_fifteen_thousand_characters() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("<pre>{}</pre>", page_with_chapter_at_fifteen_thousand_characters())))
+            .expect(1).mount(&server).await;
+        let candidates = ddg_page_client(&server).enrich_engine(SearchResponse { results: vec![SearchResult {
+            title: "钟楼书".into(), url: ddg_page_url(&server), content: "摘要".into(), raw_content: None, score: None,
+        }] }).await.unwrap();
+        let lookup = lookup_fixture();
+        let selected = select_candidate_set(&lookup, candidates).unwrap();
+        assert!(find_heading_offset(&lookup.chapters[1].heading, &selected.candidates[0].text).is_some());
+        assert!(provenance_for_chapter(&lookup, &selected.candidates, &lookup.chapters[1], ddg_page_url(&server), "第二章 钟楼，林昭在钟楼发现钥匙".into()).is_some());
+    }
+
+    #[tokio::test]
+    async fn tavily_enrichment_retains_chapter_at_fifteen_thousand_characters() {
+        let server = MockServer::start().await;
+        let client = TavilyClient::with_endpoint("tvly-test".into(), format!("{}/search", server.uri())).unwrap();
+        let url = "https://public.example/book";
+        let candidates = client.enrich_engine(SearchResponse { results: vec![SearchResult {
+            title: "钟楼书".into(), url: url.into(), content: String::new(),
+            raw_content: Some(page_with_chapter_at_fifteen_thousand_characters()), score: None,
+        }] }).await.unwrap();
+        let lookup = lookup_fixture();
+        let selected = select_candidate_set(&lookup, candidates).unwrap();
+        assert!(find_heading_offset(&lookup.chapters[1].heading, &selected.candidates[0].text).is_some());
+        assert!(provenance_for_chapter(&lookup, &selected.candidates, &lookup.chapters[1], url.into(), "第二章 钟楼，林昭在钟楼发现钥匙".into()).is_some());
     }
 
     #[tokio::test]
