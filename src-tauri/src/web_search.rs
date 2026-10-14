@@ -13,7 +13,7 @@ pub const TARGET_DOMAINS: &[&str] = &[
 const MAX_RESULTS: usize = 5;
 const MAX_CANDIDATES: usize = 4;
 const MAX_CANDIDATE_CHARS: usize = 12_000;
-const MAX_PROMPT_CHARS_PER_CANDIDATE: usize = 4_500;
+const MAX_PROMPT_CHARS_PER_CANDIDATE: usize = 20_000;
 const MAX_EVIDENCE_CHARS: usize = 280;
 const MAX_HTTP_RESPONSE_BYTES: usize = 1_500_000;
 const MAX_EDITION_PARAGRAPH_CHARS: usize = 700;
@@ -939,7 +939,24 @@ fn bibliographic_identity_matches(lookup: &OutlineLookup, candidate: &RawCandida
     let title = normalize(&lookup.book_title);
     if title.chars().count() < 2 || !haystack.contains(&title) { return false; }
     match lookup.author.as_deref().map(normalize).filter(|author| !author.is_empty()) {
-        Some(author) => haystack.contains(&author), None => true,
+        Some(author) => ![(&candidate.title, true), (&candidate.text, false)].into_iter().any(|(text, is_title)| {
+            let mut consumed_until = 0;
+            text.match_indices("作者").any(|(offset, _)| {
+                if offset < consumed_until { return false; }
+                let suffix = text[offset + "作者".len()..].trim_start();
+                let name = if let Some(name) = suffix.strip_prefix([':', '：']) {
+                    name.trim_start()
+                } else if is_title {
+                    suffix
+                } else {
+                    return false;
+                };
+                let end = name.find(|character: char| !character.is_alphanumeric() && character != '·').unwrap_or(name.len());
+                consumed_until = text.len() - name.len() + end;
+                let found = normalize(&name[..end]);
+                !found.is_empty() && found != author
+            })
+        }), None => true,
     }
 }
 fn is_public_http_url(value: &str) -> bool {
@@ -1580,17 +1597,31 @@ mod tests {
     }
 
     #[test]
+    fn chapter_heading_ten_thousand_characters_into_visible_window_is_locatable() {
+        let lookup = lookup_fixture();
+        let mut raw = good_raw().split("\n第二章").next().unwrap().to_owned();
+        raw.push_str(&"填".repeat(10_000 - raw.chars().count()));
+        raw.push_str("\n第二章 钟楼，林昭在钟楼发现钥匙。");
+        let candidate = RawCandidate { title: "钟楼书".into(), url: "https://public.example/chapter-1".into(), text: raw };
+        let selected = select_candidate_set(&lookup, vec![candidate]).unwrap();
+        assert!(find_heading_offset(&lookup.chapters[1].heading, &selected.candidates[0].text).is_some());
+        assert!(provenance_for_chapter(&lookup, &selected.candidates, &lookup.chapters[1], "https://public.example/chapter-1".into(), "第二章 钟楼，林昭在钟楼发现钥匙".into()).is_some());
+    }
+
+    #[test]
     fn two_headings_beyond_prompt_window_cannot_pass_preflight_or_claim_validation() {
         let mut lookup = lookup_fixture();
         lookup.chapters.push(LocalOutlineChapter { index: 3, heading: "第三章 河岸".into(), text: String::new() });
         let mut raw = good_raw().split("\n第二章").next().unwrap().to_owned();
-        raw.push_str(&"无关填充".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE));
+        raw.push_str(&"填".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE + 1 - raw.chars().count()));
         raw.push_str("\n第二章 钟楼，林昭在钟楼发现钥匙。\n第三章 河岸，林昭沿河岸继续调查失踪事件。");
         assert!(find_heading_offset(&lookup.chapters[1].heading, &raw).is_some());
         assert!(find_heading_offset(&lookup.chapters[2].heading, &raw).is_some());
         let candidate = RawCandidate { title: "钟楼书".into(), url: "https://public.example/chapter-1".into(), text: raw };
         assert!(matches!(select_candidate_set(&lookup, vec![candidate.clone()]), Err(WebOutlineRejection::EvidenceInsufficient)));
         let visible = RawCandidate { text: clip(&candidate.text, MAX_PROMPT_CHARS_PER_CANDIDATE), ..candidate };
+        assert!(find_heading_offset(&lookup.chapters[1].heading, &visible.text).is_none());
+        assert!(find_heading_offset(&lookup.chapters[2].heading, &visible.text).is_none());
         assert!(provenance_for_chapter(&lookup, &[visible], &lookup.chapters[1], "https://public.example/chapter-1".into(), "第二章 钟楼，林昭在钟楼发现钥匙".into()).is_none());
     }
 
@@ -1713,8 +1744,9 @@ mod tests {
         let lookup = OutlineLookup { book_title: "钟楼书".into(), author: None, chapters: vec![
             LocalOutlineChapter { index: 1, heading: "第一章".into(), text: body.clone() },
         ] };
-        let candidate = RawCandidate { title: "钟楼书".into(), url: "https://public.example/long-proof".into(), text: format!("{}\n第一章\n{body}", "无关填充".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE)) };
+        let candidate = RawCandidate { title: "钟楼书".into(), url: "https://public.example/long-proof".into(), text: format!("{}\n第一章\n{body}", "填".repeat(MAX_PROMPT_CHARS_PER_CANDIDATE + 1)) };
         assert!(source_first_paragraph(&lookup, &candidate).is_some());
+        assert!(source_first_paragraph(&lookup, &RawCandidate { text: clip(&candidate.text, MAX_PROMPT_CHARS_PER_CANDIDATE), ..candidate.clone() }).is_none());
         assert!(matches!(select_candidate_set(&lookup, vec![candidate]), Err(WebOutlineRejection::EvidenceInsufficient)));
     }
 
@@ -1869,20 +1901,24 @@ mod tests {
     }
 
     #[test]
-    fn known_author_is_required_for_bibliographic_identity() {
+    fn known_author_only_rejects_conflicting_bibliographic_identity() {
         let mut lookup = lookup_fixture(); lookup.author = Some("作者甲".into());
         let without_author = RawCandidate { title: "钟楼书".into(), url: "https://public.example/1".into(), text: good_raw().into() };
-        let with_author = RawCandidate { title: "钟楼书 作者甲".into(), ..without_author.clone() };
-        assert!(!bibliographic_identity_matches(&lookup, &without_author));
+        let with_author = RawCandidate { title: "钟楼书 作者：作者甲".into(), ..without_author.clone() };
+        let conflicting_author = RawCandidate { text: format!("作者：作者乙\n{}", good_raw()), ..without_author.clone() };
+        assert!(bibliographic_identity_matches(&lookup, &without_author));
         assert!(bibliographic_identity_matches(&lookup, &with_author));
+        assert!(!bibliographic_identity_matches(&lookup, &conflicting_author));
     }
     #[test]
-    fn known_single_character_author_is_not_ignored_for_identity() {
+    fn known_single_character_author_only_rejects_conflicting_identity() {
         let mut lookup = lookup_fixture(); lookup.author = Some("甲".into());
         let without_author = RawCandidate { title: "钟楼书".into(), url: "https://public.example/1".into(), text: good_raw().into() };
         let with_author = RawCandidate { title: "钟楼书 作者甲".into(), ..without_author.clone() };
-        assert!(!bibliographic_identity_matches(&lookup, &without_author));
+        let conflicting_author = RawCandidate { title: "钟楼书 作者乙".into(), ..without_author.clone() };
+        assert!(bibliographic_identity_matches(&lookup, &without_author));
         assert!(bibliographic_identity_matches(&lookup, &with_author));
+        assert!(!bibliographic_identity_matches(&lookup, &conflicting_author));
     }
 
 
