@@ -652,8 +652,8 @@ async fn prepare_candidate_set<E: SearchEngine>(
     select_candidate_set(lookup, candidates)
 }
 
-/// Match bibliographic candidates by the host's last two labels (not a public
-/// suffix lookup). IP addresses and single-label hosts keep their full identity.
+/// Match bibliographic candidates by registrable-domain grouping keys, handling
+/// common public suffixes explicitly and preserving IP/single-label identities.
 /// A group supplies every chapter, while its first proof-bearing page alone
 /// anchors the unchanged AI edition comparison; retain all pages for provenance.
 fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -> Result<CandidateSet, WebOutlineRejection> {
@@ -671,18 +671,8 @@ fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -
         }
         let Ok(url) = Url::parse(&candidate.url) else { continue; };
         let Some(host) = url.host_str() else { continue; };
-        let host = host.strip_suffix('.').unwrap_or(host);
-        let domain = if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
-            host
-        } else {
-            let mut labels = host.rsplitn(3, '.');
-            let last = labels.next().unwrap_or(host);
-            match labels.next() {
-                Some(previous) => &host[host.len() - previous.len() - last.len() - 1..],
-                None => host,
-            }
-        };
-        groups.entry(domain.to_owned()).or_default().push(candidate);
+        let group_key = registrable_domain_key(host);
+        groups.entry(group_key.to_owned()).or_default().push(candidate);
     }
     if !has_text { return Err(WebOutlineRejection::EditionTextUnavailable); }
     let mut complete = None;
@@ -704,6 +694,32 @@ fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -
         });
     }
     complete.ok_or(if insufficient { WebOutlineRejection::EvidenceInsufficient } else { WebOutlineRejection::EditionUnverified })
+}
+
+/// Bounded public-suffix handling, not a complete Public Suffix List. Unknown
+/// suffixes retain the last-two-label fallback. No extra Unicode/punycode
+/// normalization is performed here; distinct representations stay separate.
+fn registrable_domain_key(host: &str) -> &str {
+    const COMMON_PUBLIC_SUFFIXES: &[&str] = &[
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "com.cn", "net.cn", "org.cn", "gov.cn",
+        "com.tw", "com.hk", "com.sg", "com.my", "co.jp", "co.kr", "com.au", "net.au",
+        "github.io", "gitlab.io", "vercel.app", "netlify.app", "pages.dev",
+        "com.br", "com.mx", "com.ar", "co.in", "co.za",
+    ];
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() { return host; }
+    for &suffix in COMMON_PUBLIC_SUFFIXES {
+        if host == suffix { return host; }
+        let Some(prefix) = host.strip_suffix(suffix).and_then(|prefix| prefix.strip_suffix('.')) else { continue; };
+        let label = prefix.rsplit('.').next().unwrap_or(prefix);
+        return &host[prefix.len() - label.len()..];
+    }
+    let mut labels = host.rsplitn(3, '.');
+    let last = labels.next().unwrap_or(host);
+    match labels.next() {
+        Some(previous) => &host[host.len() - previous.len() - last.len() - 1..],
+        None => host,
+    }
 }
 
 fn first_paragraph(text: &str, max_chars: usize) -> Option<String> {
@@ -1579,6 +1595,44 @@ mod tests {
         let (lookup, mut candidates) = multi_page_fixture("public.example");
         candidates[1].url = "https://other.example/chapters-4-6".into();
         assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn public_suffix_sites_do_not_combine() {
+        for suffix in [
+            "co.uk", "org.uk", "ac.uk", "gov.uk", "com.cn", "net.cn", "org.cn", "gov.cn",
+            "com.tw", "com.hk", "com.sg", "com.my", "co.jp", "co.kr", "com.au", "net.au",
+            "github.io", "gitlab.io", "vercel.app", "netlify.app", "pages.dev",
+            "com.br", "com.mx", "com.ar", "co.in", "co.za",
+        ] {
+            let (lookup, mut candidates) = multi_page_fixture(&format!("a.{suffix}"));
+            candidates[1].url = format!("https://b.{suffix}/chapters-4-6");
+            assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)),
+                "distinct sites under {suffix} must not share chapter coverage");
+        }
+    }
+
+    #[test]
+    fn github_io_tenants_do_not_combine() {
+        let (lookup, mut candidates) = multi_page_fixture("alice.github.io");
+        candidates[1].url = "https://bob.github.io/chapters-4-6".into();
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::EvidenceInsufficient)));
+    }
+
+    #[test]
+    fn public_suffix_site_subdomains_combine() {
+        for site in ["a.co.uk", "alice.github.io"] {
+            let (lookup, mut candidates) = multi_page_fixture(&format!("x.{site}"));
+            candidates[1].url = format!("https://y.{site}/chapters-4-6");
+            assert_eq!(select_candidate_set(&lookup, candidates).unwrap().candidates.len(), 2);
+        }
+    }
+
+    #[test]
+    fn public_suffix_match_requires_a_label_boundary() {
+        let (lookup, mut candidates) = multi_page_fixture("x.aco.uk");
+        candidates[1].url = "https://y.aco.uk/chapters-4-6".into();
+        assert_eq!(select_candidate_set(&lookup, candidates).unwrap().candidates.len(), 2);
     }
 
     #[test]
