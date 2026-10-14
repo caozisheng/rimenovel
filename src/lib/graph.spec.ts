@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { filterGraph, sortEvents, eventNodeKeys, preparationPhases, preparationProgress, rewritePreparationReady, canStartQuickRead, type GraphData, type GraphEvent } from "./graph";
+import { filterGraph, sortEvents, eventNodeKeys, preparationPhases, preparationProgress, safePreparationDiagnostics, rewritePreparationReady, canStartQuickRead, type GraphData, type GraphEvent } from "./graph";
 import { useGraphSelectionStore } from "./graphSelection";
 
 const event = (key: string, chapter_idx: number, order: number): GraphEvent => ({ key, chapter_idx, order, title: key, participants: ["person", "person"], location: "place", time: null, summary: "", provenance: "user" });
@@ -57,6 +57,18 @@ describe("shared graph selection", () => {
     store.select("edge", "relationship");
     expect(store.selection).toEqual({ kind: "edge", key: "relationship" });
     expect(store.highlightedNodeKeys).toEqual([]);
+  });
+});
+
+describe("engine-layered preparation labels", () => {
+  it("labels ddg stages and engine-prefixed rejections for reader diagnostics", () => {
+    for (const phase of ["ddg_search","ddg_search_broad","ddg_match","ddg_outline"]) {
+      expect(preparationProgress({ kind: "quick_read", phase } as never)).toContain("DuckDuckGo");
+    }
+    const diagnostics=safePreparationDiagnostics({book_id:1,kind:"quick_read",state:"failed",progress:0,web_rejection:"ddg_rate_limited"});
+    expect(diagnostics.some(d=>d.includes("DuckDuckGo"))).toBe(true);
+    const tavilyDiagnostics=safePreparationDiagnostics({book_id:1,kind:"quick_read",state:"failed",progress:0,web_rejection:"tavily_search_unavailable"});
+    expect(tavilyDiagnostics.some(d=>d.includes("Tavily"))).toBe(true);
   });
 });
 

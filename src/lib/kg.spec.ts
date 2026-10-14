@@ -62,6 +62,14 @@ describe("knowledge graph IPC boundary", () => {
     expect(() => parseJobStatus({...status,web_rejection:"未读人物秘密"})).toThrow(/web_rejection/);
     expect(() => parseJobStatus({...status,local_failure_kind:"未读人物秘密"})).toThrow(/local_failure_kind/);
   });
+  it("accepts engine-prefixed web rejection codes, still rejecting free text", () => {
+    const status={book_id:1,kind:"quick_read",state:"failed",progress:0};
+    for (const code of ["ddg_rate_limited","ddg_search_unavailable","ddg_edition_text_unavailable","ddg_evidence_insufficient","ddg_edition_unverified","ddg_ambiguous_sources","ddg_invalid_outline","tavily_search_unavailable","tavily_rate_limited","tavily_edition_unverified"]) {
+      expect(parseJobStatus({...status,web_rejection:code})).toMatchObject({web_rejection:code});
+    }
+    expect(() => parseJobStatus({...status,web_rejection:"ddg_未读人物秘密"})).toThrow(/web_rejection/);
+    expect(() => parseJobStatus({...status,web_rejection:"bing_search_unavailable"})).toThrow(/web_rejection/);
+  });
   it("rejects invalid lightweight metadata at the IPC boundary", () => {
     expect(() => parseGraphView({ ...validView, coverage: { ...validView.coverage, mode: "all" } })).toThrow(/coverage.mode/);
     expect(() => parseGraphView({ ...validView, nodes: [{ ...validView.nodes[0], life_status: "missing" }] })).toThrow(/life_status/);
