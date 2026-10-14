@@ -1442,7 +1442,7 @@ mod tests {
                 "title":"钟楼书", "url":url, "content":"摘要", "raw_content":page_with_chapter_at_fifteen_thousand_characters()
             }]}))).expect(1).mount(&server).await;
         let candidates = client.search("钟楼书", None).await.unwrap();
-        let candidates = enrich_candidates(&client, candidates).await.unwrap();
+        let candidates = client.enrich_engine(candidates).await.unwrap();
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/search");
