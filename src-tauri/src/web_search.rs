@@ -656,6 +656,8 @@ async fn prepare_candidate_set<E: SearchEngine>(
 /// common public suffixes explicitly and preserving IP/single-label identities.
 /// A group supplies every chapter, while its first proof-bearing page alone
 /// anchors the unchanged AI edition comparison; retain all pages for provenance.
+/// Shared chapter bodies must agree after normalizing their first 200 characters
+/// (excluding the heading line); identical mirrors and disjoint pages coexist.
 fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -> Result<CandidateSet, WebOutlineRejection> {
     let mut groups: BTreeMap<String, Vec<RawCandidate>> = BTreeMap::new();
     let mut has_text = false;
@@ -686,6 +688,24 @@ fn select_candidate_set(lookup: &OutlineLookup, candidates: Vec<RawCandidate>) -
         })) {
             insufficient = true;
             continue;
+        }
+        if group.len() > 1 {
+            for chapter in &lookup.chapters {
+                let mut shared_prefix = None;
+                for candidate in &group {
+                    let Some(section) = chapter_section(chapter, &lookup.chapters, &candidate.text) else { continue; };
+                    let body = section.split_once('\n').map_or("", |(_, body)| body);
+                    let end = body.char_indices().nth(200).map_or(body.len(), |(offset, _)| offset);
+                    let prefix = normalize(&body[..end]);
+                    // Equality with the first located section proves pairwise
+                    // equality without normalizing each page for every pair.
+                    if let Some(expected) = &shared_prefix {
+                        if expected != &prefix { return Err(WebOutlineRejection::AmbiguousSources); }
+                    } else {
+                        shared_prefix = Some(prefix);
+                    }
+                }
+            }
         }
         if complete.is_some() { return Err(WebOutlineRejection::AmbiguousSources); }
         complete = Some(CandidateSet {
@@ -1673,13 +1693,52 @@ mod tests {
     }
 
     #[test]
-    fn same_domain_complete_pages_form_one_group() {
+    fn mirror_candidates_with_identical_sections_are_not_ambiguous() {
         let lookup = lookup_fixture();
         let first = RawCandidate { title: "钟楼书".into(), url: "https://public.example/a".into(), text: good_raw().into() };
         let second = RawCandidate { url: "https://public.example/b".into(), ..first.clone() };
         let selected = select_candidate_set(&lookup, vec![first.clone(), second]).unwrap();
         assert_eq!(selected.candidates.len(), 2);
         assert_eq!(selected.primary.url, first.url);
+    }
+
+    #[test]
+    fn conflicting_section_text_rejects_group() {
+        let (lookup, mut candidates) = multi_page_fixture("public.example");
+        let mirror = RawCandidate { url: "https://public.example/mirror".into(), ..candidates[0].clone() };
+        let conflict = RawCandidate {
+            url: "https://public.example/conflict".into(),
+            text: candidates[1].text.replace("钟楼的钟声", "旧宅的秘密"),
+            ..candidates[1].clone()
+        };
+        candidates.extend([mirror, conflict]);
+        assert!(matches!(select_candidate_set(&lookup, candidates), Err(WebOutlineRejection::AmbiguousSources)));
+    }
+
+    #[test]
+    fn mirror_sections_ignore_heading_lines_and_normalize_body_prefixes() {
+        let (lookup, mut candidates) = multi_page_fixture("public.example");
+        let mirror = RawCandidate {
+            url: "https://public.example/mirror".into(),
+            text: candidates[0].text.replace("第1章", "第一章 镜像页").replace("钟声。", "钟声！"),
+            ..candidates[0].clone()
+        };
+        candidates.push(mirror);
+        assert_eq!(select_candidate_set(&lookup, candidates).unwrap().candidates.len(), 3);
+    }
+
+    #[test]
+    fn mirror_section_comparison_is_limited_to_two_hundred_characters() {
+        let (lookup, mut candidates) = multi_page_fixture("public.example");
+        let prefix = "正文".repeat(100);
+        candidates[0].text = format!("第1章\n{prefix}左侧后文\n{}", candidates[0].text);
+        let mirror = RawCandidate {
+            url: "https://public.example/mirror".into(),
+            text: candidates[0].text.replace("左侧后文", "右侧后文"),
+            ..candidates[0].clone()
+        };
+        candidates.push(mirror);
+        assert_eq!(select_candidate_set(&lookup, candidates).unwrap().candidates.len(), 3);
     }
 
     #[test]
@@ -1726,6 +1785,25 @@ mod tests {
         let tavily = TavilyClient::with_endpoint("tvly-private".into(), format!("{}/search", server.uri())).unwrap();
         let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
         assert!(matches!(find_outline(&tavily, &llm, &lookup_fixture(), WebOutlineBudget::new(100_000, 4_096)).await,
+            Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources))));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn conflicting_targeted_group_is_terminal_without_broad_retry() {
+        let (lookup, candidates) = multi_page_fixture("public.example");
+        let text = format!("{}{}", candidates[0].text, candidates[1].text);
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/search"))
+            .and(wiremock::matchers::body_string_contains("include_domains"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[
+                {"title":"钟楼书","url":"https://public.example/a","content":"","raw_content":text},
+                {"title":"钟楼书","url":"https://public.example/b","content":"","raw_content":text.replace("钟楼的钟声", "旧宅的秘密")}
+            ]}))).expect(1).mount(&server).await;
+        let tavily = TavilyClient::with_endpoint("tvly-private".into(), format!("{}/search", server.uri())).unwrap();
+        let llm = StubLlm { value: good_outline(), calls: AtomicUsize::new(0), prompt: Mutex::new(String::new()), cancelled: false };
+        assert!(matches!(find_outline(&tavily, &llm, &lookup, WebOutlineBudget::new(100_000, 4_096)).await,
             Err(WebOutlineError::Rejected(WebOutlineRejection::AmbiguousSources))));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
